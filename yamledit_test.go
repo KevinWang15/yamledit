@@ -1,0 +1,680 @@
+package yamledit
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+func TestParseErrorsOnNonMappingTopLevel(t *testing.T) {
+	in := []byte("- 1\n- 2\n")
+	if _, err := Parse(in); err == nil {
+		t.Fatalf("expected error for non-mapping top-level, got nil")
+	}
+}
+
+func TestEnsurePathAndSetScalarIntOnExistingNestedMap(t *testing.T) {
+	in := []byte("a:\n  b:\n    c: 1\n")
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Locate the nested mapping node for "b" directly
+	bNode := findMapNode(doc.Content[0], "a", "b")
+	if bNode == nil {
+		t.Fatalf("failed to find mapping node for a.b")
+	}
+
+	SetScalarInt(bNode, "c", 42)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	if !strings.Contains(string(out), "c: 42") {
+		t.Fatalf("expected c: 42 in output, got:\n%s", string(out))
+	}
+}
+
+func TestDuplicateKeysCollapseToSingleEntry(t *testing.T) {
+	in := []byte("dup:\n  a: 1\n  a: 2\n")
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	dup := EnsurePath(doc, "dup")
+	SetScalarInt(dup, "a", 9)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	s := string(out)
+	if strings.Count(s, "a: ") != 1 || !strings.Contains(s, "a: 9") {
+		t.Fatalf("expected single 'a: 9', got:\n%s", s)
+	}
+}
+
+func TestEnsurePathConvertsScalarToMapping(t *testing.T) {
+	in := []byte("x: 1\n")
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	// Convert x (scalar) -> mapping
+	m := EnsurePath(doc, "x")
+	if m == nil || m.Kind != yaml.MappingNode {
+		t.Fatalf("EnsurePath did not produce a mapping for 'x'")
+	}
+
+	// Write and ensure shape is mapping
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	var round yaml.Node
+	if err := yaml.Unmarshal(out, &round); err != nil {
+		t.Fatalf("unmarshal roundtrip: %v", err)
+	}
+	x := findMapNode(round.Content[0], "x")
+	if x == nil || x.Kind != yaml.MappingNode {
+		t.Fatalf("after write, 'x' is not a mapping")
+	}
+}
+
+func TestConcurrentSetScalarIntOnSameMapIsSafe(t *testing.T) {
+	in := []byte("root: {}\n")
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	root := EnsurePath(doc, "root")
+
+	done := make(chan struct{})
+	go func() {
+		SetScalarInt(root, "x", 1)
+		done <- struct{}{}
+	}()
+	go func() {
+		SetScalarInt(root, "y", 2)
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Verify both keys present after roundtrip.
+	type M map[string]any
+	var top struct {
+		Root M `yaml:"root"`
+	}
+	if err := yaml.Unmarshal(out, &top); err != nil {
+		t.Fatalf("yaml unmarshal: %v\n%s", err, string(out))
+	}
+	if _, ok := top.Root["x"]; !ok {
+		t.Fatalf("missing key x")
+	}
+	if _, ok := top.Root["y"]; !ok {
+		t.Fatalf("missing key y")
+	}
+}
+
+func TestEmptyDataCreatesEmptyDoc(t *testing.T) {
+	doc, err := Parse([]byte{})
+	if err != nil {
+		t.Fatalf("Parse empty should succeed, got error: %v", err)
+	}
+	if doc == nil || doc.Kind != yaml.DocumentNode {
+		t.Fatalf("expected valid document node for empty data")
+	}
+}
+
+func TestPreservesCommentsAndIndent(t *testing.T) {
+	// Test with 4-space indent
+	in := []byte(`# file header comment
+resources:
+    # cpu comment
+    cpu: 100
+    # memory comment
+    memory: 256
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	js := EnsurePath(doc, "resources")
+	SetScalarInt(js, "cpu", 150)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Comments preserved
+	if !bytes.Contains(out, []byte("# cpu comment")) || !bytes.Contains(out, []byte("# memory comment")) {
+		t.Fatalf("expected comments to be preserved; got:\n%s", string(out))
+	}
+
+	// Must preserve exact 4-space indent
+	if !bytes.Contains(out, []byte("    cpu: 150")) {
+		t.Fatalf("expected 4-space indent for cpu to be preserved; got:\n%s", string(out))
+	}
+}
+
+// --- helpers for tests ---
+
+// findMapNode walks a mapping node by a sequence of scalar keys and returns the final mapping value node.
+func findMapNode(n *yaml.Node, path ...string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	cur := n
+	for _, k := range path {
+		var found *yaml.Node
+		for i := 0; i+1 < len(cur.Content); i += 2 {
+			if cur.Content[i].Kind == yaml.ScalarNode && cur.Content[i].Value == k {
+				found = cur.Content[i+1]
+				break
+			}
+		}
+		if found == nil {
+			return nil
+		}
+		if found.Kind != yaml.MappingNode {
+			return found // return non-mapping if so (some tests expect to see this)
+		}
+		cur = found
+	}
+	return cur
+}
+
+func TestPreserves2SpaceIndent(t *testing.T) {
+	in := []byte(`root:
+  child1: value1
+  child2:
+    nested: value2
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Make a change
+	child2 := EnsurePath(doc, "root", "child2")
+	SetScalarInt(child2, "newkey", 42)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Must preserve 2-space indent
+	if !bytes.Contains(out, []byte("  child1:")) {
+		t.Errorf("Expected 2-space indent for child1, got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("    nested:")) {
+		t.Errorf("Expected 4-space indent for nested (2 levels), got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("    newkey: 42")) {
+		t.Errorf("Expected 4-space indent for newkey (2 levels), got:\n%s", out)
+	}
+}
+
+func TestPreserves4SpaceIndent(t *testing.T) {
+	in := []byte(`root:
+    child1: value1
+    child2:
+        nested: value2
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Make a change
+	child2 := EnsurePath(doc, "root", "child2")
+	SetScalarInt(child2, "newkey", 42)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Must preserve 4-space indent
+	if !bytes.Contains(out, []byte("    child1:")) {
+		t.Errorf("Expected 4-space indent for child1, got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("        nested:")) {
+		t.Errorf("Expected 8-space indent for nested (2 levels), got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("        newkey: 42")) {
+		t.Errorf("Expected 8-space indent for newkey (2 levels), got:\n%s", out)
+	}
+}
+
+func TestPreserves3SpaceIndent(t *testing.T) {
+	in := []byte(`root:
+   child: value
+   nested:
+      deep: value2
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Must preserve 3-space indent
+	if !bytes.Contains(out, []byte("   child:")) {
+		t.Errorf("Expected 3-space indent for child, got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("      deep:")) {
+		t.Errorf("Expected 6-space indent for deep (2 levels), got:\n%s", out)
+	}
+}
+
+func TestIndentDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected int
+	}{
+		{
+			name: "2 spaces",
+			input: []byte(`root:
+  child: value`),
+			expected: 2,
+		},
+		{
+			name: "4 spaces",
+			input: []byte(`root:
+    child: value`),
+			expected: 4,
+		},
+		{
+			name: "3 spaces",
+			input: []byte(`root:
+   child: value`),
+			expected: 3,
+		},
+		{
+			name: "mixed but consistent levels",
+			input: []byte(`root:
+  child:
+    deep:
+      deeper: value`),
+			expected: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detected := detectIndent(tt.input)
+			if detected != tt.expected {
+				t.Errorf("detectIndent() = %d, want %d for input:\n%s", detected, tt.expected, tt.input)
+			}
+		})
+	}
+}
+
+func TestComplexIndentPreservation(t *testing.T) {
+	in := []byte(`# Header comment
+services:
+    web:
+        # Web config
+        port: 8080
+        replicas: 3
+    db:
+        # Database config
+        host: localhost
+        port: 5432
+`)
+
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Modify values
+	web := EnsurePath(doc, "services", "web")
+	SetScalarInt(web, "replicas", 5)
+
+	db := EnsurePath(doc, "services", "db")
+	SetScalarInt(db, "port", 5433)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Verify exact indentation
+	lines := bytes.Split(out, []byte("\n"))
+	for _, line := range lines {
+		if bytes.Contains(line, []byte("web:")) {
+			if !bytes.HasPrefix(line, []byte("    web:")) {
+				t.Errorf("Expected 4-space indent for 'web:', got: %q", line)
+			}
+		}
+		if bytes.Contains(line, []byte("port:")) && bytes.Contains(line, []byte("8080")) {
+			if !bytes.HasPrefix(line, []byte("        port:")) {
+				t.Errorf("Expected 8-space indent for 'port: 8080', got: %q", line)
+			}
+		}
+		if bytes.Contains(line, []byte("replicas:")) {
+			if !bytes.HasPrefix(line, []byte("        replicas:")) {
+				t.Errorf("Expected 8-space indent for 'replicas:', got: %q", line)
+			}
+		}
+	}
+
+	// Should still have 4-space base indent
+	if !bytes.Contains(out, []byte("    web:")) {
+		t.Errorf("Lost 4-space indent for web")
+	}
+	if !bytes.Contains(out, []byte("    db:")) {
+		t.Errorf("Lost 4-space indent for db")
+	}
+}
+
+func TestIndentPreservationIsExact(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []byte
+	}{
+		{
+			name: "2-space indent",
+			input: []byte(`app:
+  name: test
+  config:
+    port: 8080
+    nested:
+      deep: value
+`),
+		},
+		{
+			name: "4-space indent",
+			input: []byte(`app:
+    name: test
+    config:
+        port: 8080
+        nested:
+            deep: value
+`),
+		},
+		{
+			name: "3-space indent",
+			input: []byte(`app:
+   name: test
+   config:
+      port: 8080
+      nested:
+         deep: value
+`),
+		},
+		{
+			name: "mixed with comments",
+			input: []byte(`# Root comment
+services:
+    # Web service
+    web:
+        port: 80  # HTTP port
+        # Security settings
+        ssl:
+            enabled: true
+    # Database
+    database:
+        host: localhost
+`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Parse
+			doc, err := Parse(tt.input)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+
+			// Make some changes
+			if tt.name == "mixed with comments" {
+				web := EnsurePath(doc, "services", "web")
+				SetScalarInt(web, "port", 443)
+			} else {
+				app := EnsurePath(doc, "app")
+				SetScalarInt(app, "version", 2)
+			}
+
+			// Marshal back
+			out, err := Marshal(doc)
+			if err != nil {
+				t.Fatalf("Marshal error: %v", err)
+			}
+
+			// Compare line by line for indent consistency
+			inLines := bytes.Split(tt.input, []byte("\n"))
+			outLines := bytes.Split(out, []byte("\n"))
+
+			for i := range inLines {
+				if i >= len(outLines) {
+					break
+				}
+
+				// Skip blank lines
+				if len(bytes.TrimSpace(inLines[i])) == 0 {
+					continue
+				}
+
+				inSpaces := countLeadingSpaces(inLines[i])
+				outSpaces := countLeadingSpaces(outLines[i])
+
+				// For unchanged lines, indent must be identical
+				if bytes.Contains(inLines[i], []byte("name:")) && bytes.Contains(outLines[i], []byte("name:")) {
+					if inSpaces != outSpaces {
+						t.Errorf("Line %d: indent changed from %d to %d spaces\nOriginal: %q\nOutput:   %q",
+							i, inSpaces, outSpaces, inLines[i], outLines[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func countLeadingSpaces(line []byte) int {
+	count := 0
+	for _, b := range line {
+		if b == ' ' {
+			count++
+		} else {
+			break
+		}
+	}
+	return count
+}
+
+func TestPreservesKeyOrder(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "simple order",
+			input: `zebra: 1
+apple: 2
+middle: 3
+`,
+		},
+		{
+			name: "nested order",
+			input: `third: 3
+first:
+  zulu: z
+  alpha: a
+  bravo: b
+second: 2
+`,
+		},
+		{
+			name: "complex order with comments",
+			input: `# Header
+zoo: animals
+bar: drinks
+foo: food
+nested:
+  last: 100
+  middle: 50
+  first: 1
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := Parse([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+
+			// Make a change
+			root := doc.Content[0]
+			SetScalarInt(root, "newkey", 999)
+
+			out, err := Marshal(doc)
+			if err != nil {
+				t.Fatalf("Marshal error: %v", err)
+			}
+
+			t.Logf("Input:\n%s", tt.input)
+			t.Logf("Output:\n%s", out)
+
+			// Check that original keys appear in the same order
+			inputLines := strings.Split(tt.input, "\n")
+			outputLines := strings.Split(string(out), "\n")
+
+			var inputKeys []string
+			for _, line := range inputLines {
+				if strings.Contains(line, ":") && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+					parts := strings.Split(line, ":")
+					key := strings.TrimSpace(parts[0])
+					if key != "" {
+						inputKeys = append(inputKeys, key)
+					}
+				}
+			}
+
+			var outputKeys []string
+			for _, line := range outputLines {
+				if strings.Contains(line, ":") && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+					parts := strings.Split(line, ":")
+					key := strings.TrimSpace(parts[0])
+					if key != "" && key != "newkey" { // Exclude the new key we added
+						outputKeys = append(outputKeys, key)
+					}
+				}
+			}
+
+			// Check that the order is preserved
+			if len(inputKeys) != len(outputKeys) {
+				t.Errorf("Key count mismatch: input had %d keys, output has %d keys", len(inputKeys), len(outputKeys))
+			}
+
+			for i := 0; i < len(inputKeys) && i < len(outputKeys); i++ {
+				if inputKeys[i] != outputKeys[i] {
+					t.Errorf("Key order not preserved at position %d: expected %q, got %q", i, inputKeys[i], outputKeys[i])
+				}
+			}
+		})
+	}
+}
+
+func TestNewKeysAppendedAtEnd(t *testing.T) {
+	input := `first: 1
+second: 2
+third: 3
+`
+	doc, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	root := doc.Content[0]
+	SetScalarInt(root, "fourth", 4)
+	SetScalarInt(root, "fifth", 5)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	lines := strings.Split(string(out), "\n")
+
+	// Find positions of keys
+	positions := make(map[string]int)
+	for i, line := range lines {
+		if strings.Contains(line, ":") {
+			parts := strings.Split(line, ":")
+			key := strings.TrimSpace(parts[0])
+			positions[key] = i
+		}
+	}
+
+	// Check order
+	if positions["first"] > positions["second"] {
+		t.Errorf("first should come before second")
+	}
+	if positions["second"] > positions["third"] {
+		t.Errorf("second should come before third")
+	}
+	if positions["third"] > positions["fourth"] {
+		t.Errorf("third should come before fourth (new keys append)")
+	}
+	if positions["fourth"] > positions["fifth"] {
+		t.Errorf("fourth should come before fifth (maintain add order)")
+	}
+}
+
+func TestModifyingExistingKeysPreservesOrder(t *testing.T) {
+	input := `gamma: 3
+alpha: 1
+beta: 2
+delta: 4
+`
+	doc, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	root := doc.Content[0]
+	// Modify existing keys
+	SetScalarInt(root, "alpha", 100)
+	SetScalarInt(root, "delta", 400)
+	SetScalarInt(root, "beta", 200)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	expected := `gamma: 3
+alpha: 100
+beta: 200
+delta: 400
+`
+
+	if string(out) != expected {
+		t.Errorf("Order not preserved.\nExpected:\n%s\nGot:\n%s", expected, out)
+	}
+}
