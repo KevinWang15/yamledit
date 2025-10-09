@@ -39,25 +39,6 @@ func TestEnsurePathAndSetScalarIntOnExistingNestedMap(t *testing.T) {
 	}
 }
 
-func TestDuplicateKeysCollapseToSingleEntry(t *testing.T) {
-	in := []byte("dup:\n  a: 1\n  a: 2\n")
-	doc, err := Parse(in)
-	if err != nil {
-		t.Fatalf("Parse error: %v", err)
-	}
-	dup := EnsurePath(doc, "dup")
-	SetScalarInt(dup, "a", 9)
-
-	out, err := Marshal(doc)
-	if err != nil {
-		t.Fatalf("Marshal error: %v", err)
-	}
-	s := string(out)
-	if strings.Count(s, "a: ") != 1 || !strings.Contains(s, "a: 9") {
-		t.Fatalf("expected single 'a: 9', got:\n%s", s)
-	}
-}
-
 func TestEnsurePathConvertsScalarToMapping(t *testing.T) {
 	in := []byte("x: 1\n")
 	doc, err := Parse(in)
@@ -677,4 +658,341 @@ delta: 400
 	if string(out) != expected {
 		t.Errorf("Order not preserved.\nExpected:\n%s\nGot:\n%s", expected, out)
 	}
+}
+
+func TestPreserveSingleQuotedScalar_UnrelatedChange(t *testing.T) {
+	in := []byte(`# header
+env:
+  HTTP_CORS_ALLOWED_ORIGINS: '*'
+  METRICS_ENABLED: "true"
+  port: 8080
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	svc := EnsurePath(doc, "env")
+	SetScalarInt(svc, "port", 9090)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(out, []byte(`HTTP_CORS_ALLOWED_ORIGINS: '*'`)) {
+		t.Fatalf("single-quoted value should be preserved; got:\n%s", out)
+	}
+
+	before := getLineContaining(string(in), "HTTP_CORS_ALLOWED_ORIGINS:")
+	after := getLineContaining(string(out), "HTTP_CORS_ALLOWED_ORIGINS:")
+	if before != after {
+		t.Fatalf("unrelated line changed:\nBEFORE: %q\nAFTER:  %q", before, after)
+	}
+}
+
+func TestPreserveDoubleQuotedScalar_UnrelatedChange(t *testing.T) {
+	in := []byte(`svc:
+  GREETING: "hello"
+  port: 8080
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	svc := EnsurePath(doc, "svc")
+	SetScalarInt(svc, "port", 9090)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	line := getLineContaining(string(out), "GREETING:")
+	if line != `  GREETING: "hello"` {
+		t.Fatalf("expected GREETING line unchanged (double quotes), got: %q", line)
+	}
+}
+
+func TestInlineCommentPreservedOnUpdatedInt(t *testing.T) {
+	in := []byte(`svc:
+  port: 8080  # http
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	svc := EnsurePath(doc, "svc")
+	SetScalarInt(svc, "port", 9090)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `  port: 9090  # http`
+	got := getLineContaining(string(out), "port:")
+	if got != want {
+		t.Fatalf("inline comment or spacing lost.\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
+	}
+}
+
+func TestSingleLineDiffOnIntegerUpdate(t *testing.T) {
+	in := []byte(`# header
+cfg:
+  a: 1
+  b: "x"
+  cors: '*'
+  c: 2
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg := EnsurePath(doc, "cfg")
+	SetScalarInt(cfg, "a", 10)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	diff := countDifferentLines(string(in), string(out))
+	if diff != 1 {
+		t.Fatalf("expected exactly 1 line to change, got %d\n--- before ---\n%s\n--- after ---\n%s", diff, in, out)
+	}
+	// And the single-quoted cors stays single-quoted.
+	if !bytes.Contains(out, []byte(`cors: '*'`)) {
+		t.Fatalf("expected cors line to remain single-quoted; got:\n%s", out)
+	}
+}
+
+func TestInsertNewIntegerKeyPreservesIndent(t *testing.T) {
+	in := []byte(`svc:
+    name: api
+    port: 8080
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	svc := EnsurePath(doc, "svc")
+	SetScalarInt(svc, "timeout", 30) // NEW key
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Existing line stays identical
+	before := getLineContaining(string(in), "name:")
+	after := getLineContaining(string(out), "name:")
+	if before != after {
+		t.Fatalf("unchanged line churned:\nBEFORE: %q\nAFTER:  %q", before, after)
+	}
+
+	// New key appears at 4-space indent, appended
+	if !bytes.Contains(out, []byte("    timeout: 30")) {
+		t.Fatalf("expected 4-space indent for newly inserted key; got:\n%s", out)
+	}
+	posPort := lineIndexContaining(string(out), "port:")
+	posTimeout := lineIndexContaining(string(out), "timeout:")
+	if !(posTimeout > posPort) {
+		t.Fatalf("new key should be appended after existing ones; port line idx=%d, timeout idx=%d", posPort, posTimeout)
+	}
+}
+
+func TestTopLevelInsertAppendsWithoutTouchingHeader(t *testing.T) {
+	in := []byte(`# header
+alpha: 1
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	root := doc.Content[0]
+	SetScalarInt(root, "beta", 2)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// header intact
+	if getLineContaining(string(out), "# header") != "# header" {
+		t.Fatalf("header changed: %q", getLineContaining(string(out), "# header"))
+	}
+	// ordering: alpha before beta
+	iAlpha := lineIndexContaining(string(out), "alpha:")
+	iBeta := lineIndexContaining(string(out), "beta:")
+	if !(iAlpha >= 0 && iBeta > iAlpha) {
+		t.Fatalf("beta should be appended after alpha; alpha=%d beta=%d\n%s", iAlpha, iBeta, out)
+	}
+}
+
+func TestShapeChangeFallbackDoesNotChurnOtherQuotes(t *testing.T) {
+	in := []byte(`x: 1
+note: "*"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Force shape change: x (scalar) -> mapping
+	_ = EnsurePath(doc, "x")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// x is a mapping now
+	var round yaml.Node
+	if err := yaml.Unmarshal(out, &round); err != nil {
+		t.Fatalf("unmarshal round: %v\n%s", err, out)
+	}
+	x := findMapNode(round.Content[0], "x")
+	if x == nil || x.Kind != yaml.MappingNode {
+		t.Fatalf("'x' should be mapping after write; got kind=%v", x)
+	}
+
+	// note's double quotes remain double quotes
+	if getLineContaining(string(out), "note:") != `note: "*"` {
+		t.Fatalf("expected note line to stay double-quoted; got: %q\nfull:\n%s",
+			getLineContaining(string(out), "note:"), out)
+	}
+}
+
+func TestIndentlessSequenceUnchangedOnUnrelatedChange(t *testing.T) {
+	in := []byte(`items:
+- a
+- b
+settings:
+  port: 8080
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	settings := EnsurePath(doc, "settings")
+	SetScalarInt(settings, "port", 8081)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if getLineContaining(string(out), "- a") != "- a" || getLineContaining(string(out), "- b") != "- b" {
+		t.Fatalf("indentless sequence should be untouched; got:\n%s", out)
+	}
+}
+
+func TestFinalNewlinePreserved(t *testing.T) {
+	in := []byte("svc:\n  port: 8080\n") // ends with newline
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	svc := EnsurePath(doc, "svc")
+	SetScalarInt(svc, "port", 9090)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(out) == 0 || out[len(out)-1] != '\n' {
+		t.Fatalf("final newline should be preserved; got bytes: %v", out)
+	}
+}
+
+func TestInsertNewKeyAtEOF_NoFinalNewline_SeparatesLine(t *testing.T) {
+	// No newline at EOF; last line is the nested mapping's last line.
+	in := []byte(`deploy:
+  serviceAccount:
+    create: "true"`)
+
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	js := EnsurePath(doc, "deploy")
+
+	// Insert a new top-level key under "config"
+	SetScalarInt(js, "replicas", 5)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(out)
+
+	// Must NOT be appended to the same line as 'create: "true"'
+	if strings.Contains(s, `create: "true" replicas:`) {
+		t.Fatalf("new key appended to same line; got:\n%s", s)
+	}
+
+	// The new key should appear on its own line with the correct (2-space) indent
+	if !strings.Contains(s, "\n  replicas: 5\n") && !strings.HasSuffix(s, "\n  replicas: 5") {
+		t.Fatalf("expected '  replicas: 5' on a new line; got:\n%s", s)
+	}
+
+	// Ensure the order is correct: 'replicas' comes after 'serviceAccount' block
+	iCreate := strings.Index(s, `create: "true"`)
+	iRep := strings.Index(s, "replicas: 5")
+	if !(iCreate >= 0 && iRep > iCreate) {
+		t.Fatalf("expected replicas to be appended after serviceAccount; create=%d replicas=%d\n%s", iCreate, iRep, s)
+	}
+}
+
+// --- small helpers ---
+
+func getLineContaining(s, substr string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.Contains(ln, substr) {
+			return ln
+		}
+	}
+	return ""
+}
+
+func lineIndexContaining(s, substr string) int {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if strings.Contains(ln, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func countDifferentLines(a, b string) int {
+	as := strings.Split(a, "\n")
+	bs := strings.Split(b, "\n")
+	n := max(len(as), len(bs))
+	diff := 0
+	for i := 0; i < n; i++ {
+		var la, lb string
+		if i < len(as) {
+			la = as[i]
+		}
+		if i < len(bs) {
+			lb = bs[i]
+		}
+		if la != lb {
+			diff++
+		}
+	}
+	return diff
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

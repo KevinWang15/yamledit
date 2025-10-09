@@ -4,22 +4,56 @@ import (
 	"bytes"
 	"fmt"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 
 	gyaml "github.com/goccy/go-yaml"
 	"gopkg.in/yaml.v3"
 )
 
+// --------------------------------------------------------------------------------------
+// Internal state registered per root yaml.DocumentNode
+// --------------------------------------------------------------------------------------
+
 type docState struct {
 	mu          sync.RWMutex
 	doc         *yaml.Node              // back-reference to the root document
-	indent      int                     // detected indent (2 or 4 spaces typically)
+	indent      int                     // detected indent (2,3,4,...)
 	indentSeq   bool                    // whether sequences under a key are indented
-	ordered     gyaml.MapSlice          // ordered mapping we actually edit
-	comments    gyaml.CommentMap        // captured comments
+	ordered     gyaml.MapSlice          // current ordered mapping we edit (live view)
+	comments    gyaml.CommentMap        // captured comments (for fallback encode)
 	subPathByHN map[*yaml.Node][]string // mapping-handle -> YAML path segments from root
+
+	// --- Byte-surgical indices ---
+	original    []byte // original file bytes (exact)
+	lineOffsets []int  // starting offset of each line in original
+	origOrdered gyaml.MapSlice
+
+	// Map-level index: information about each mapping path found in the original bytes
+	mapIndex map[string]*mapInfo
+
+	// Scalar value positions (original) keyed by path + key (we store all occurrences to handle dups)
+	valueOccByPathKey map[string][]valueOcc
 }
 
+// Information about a mapping block in the original YAML
+type mapInfo struct {
+	indent       int // indent (in spaces) of keys inside this mapping
+	lastLineEnd  int // byte offset of the newline that ends the last key/value line in this mapping
+	hasAnyKey    bool
+	originalPath bool // mapping existed in the original bytes
+}
+
+// One occurrence of "key: value" in the original file
+type valueOcc struct {
+	keyLineStart int // start offset of the line where the key begins
+	valStart     int // start offset of the value token
+	valEnd       int // end offset (exclusive) of the value token
+	lineEnd      int // offset of '\n' ending this line (or len(original)-1 if final line has no \n)
+}
+
+// Global registry so we can look up state by *yaml.Node (doc)
 var (
 	regMu sync.Mutex
 	reg   = map[*yaml.Node]*docState{}
@@ -44,6 +78,10 @@ func lookup(doc *yaml.Node) (*docState, bool) {
 	return st, ok
 }
 
+// --------------------------------------------------------------------------------------
+// Public API
+// --------------------------------------------------------------------------------------
+
 // Parse reads YAML data and returns a yaml.Node, creating a minimal mapping document if empty.
 func Parse(data []byte) (*yaml.Node, error) {
 	doc := &yaml.Node{
@@ -62,17 +100,21 @@ func Parse(data []byte) (*yaml.Node, error) {
 		doc = &tmp
 	}
 
-	// Build shadow state using goccy/go-yaml
+	// Build shadow state using goccy/go-yaml (to preserve comments and ordered map for fallback)
 	st := &docState{
-		doc:         doc,
-		comments:    gyaml.CommentMap{},
-		ordered:     gyaml.MapSlice{},
-		subPathByHN: map[*yaml.Node][]string{},
-		indent:      2,
-		indentSeq:   true,
+		doc:               doc,
+		comments:          gyaml.CommentMap{},
+		ordered:           gyaml.MapSlice{},
+		subPathByHN:       map[*yaml.Node][]string{},
+		indent:            2,
+		indentSeq:         true,
+		original:          append([]byte(nil), data...),
+		lineOffsets:       buildLineOffsets(data),
+		mapIndex:          map[string]*mapInfo{},
+		valueOccByPathKey: map[string][]valueOcc{},
 	}
 
-	// Decode into ordered map and capture comments
+	// Decode into ordered map and capture comments; detect indent and sequence style
 	if len(data) > 0 {
 		if err := gyaml.UnmarshalWithOptions(data, &st.ordered, gyaml.UseOrderedMap(), gyaml.CommentToMap(st.comments)); err == nil {
 			ind, seq := detectIndentAndSequence(data)
@@ -80,17 +122,25 @@ func Parse(data []byte) (*yaml.Node, error) {
 		}
 	}
 
-	// Index mapping handles
+	// Keep a snapshot of the original ordered map for diffing
+	st.origOrdered = cloneMapSlice(st.ordered)
+
+	// Index mapping handles (for path lookups later on)
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
 		st.subPathByHN[doc.Content[0]] = nil
 		indexMappingHandles(st, doc.Content[0], nil)
+
+		// Build byte-surgical indices off the original parsed tree
+		if len(data) > 0 {
+			indexPositions(st, doc.Content[0], nil)
+		}
 	}
 
 	register(doc, st)
 	return doc, nil
 }
 
-// Marshal encodes the YAML preserving comments and formatting.
+// Marshal encodes the YAML. Prefer byte-surgical patching when safe; otherwise fall back.
 func Marshal(doc *yaml.Node) ([]byte, error) {
 	st, ok := lookup(doc)
 	if !ok {
@@ -104,21 +154,31 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	}
 
 	st.mu.RLock()
-	ordered := st.ordered
+	ordered := cloneMapSlice(st.ordered) // snapshot
 	comments := st.comments
 	indent := st.indent
 	indentSeq := st.indentSeq
+	original := st.original
+	mapIdx := cloneMapIndex(st.mapIndex)
+	valIdx := cloneValueIndex(st.valueOccByPathKey)
+	origOrdered := cloneMapSlice(st.origOrdered)
 	st.mu.RUnlock()
+
+	// Attempt byte-surgical patching
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent)
+	if okPatch {
+		return out, nil
+	}
 
 	var buf bytes.Buffer
 	enc := gyaml.NewEncoder(
 		&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments),
 	)
 	if err := enc.Encode(ordered); err != nil {
+		_ = enc.Close()
 		return nil, err
 	}
 	_ = enc.Close()
-
 	return buf.Bytes(), nil
 }
 
@@ -161,8 +221,11 @@ func EnsurePath(doc *yaml.Node, first string, rest ...string) *yaml.Node {
 	}
 
 	if st != nil {
+		// keep our ordered (logical) view in sync
 		st.ordered = ensureOrderedPath(st.ordered, keys...)
 		st.subPathByHN[cur] = append([]string(nil), keys...)
+		// Note: indices for surgical edit (mapIndex/valueOccByPathKey) are based on the original file.
+		// Newly-created path doesn't exist in original bytes, so surgical editing will auto-fallback.
 	}
 
 	return cur
@@ -203,7 +266,8 @@ func SetScalarInt(mapNode *yaml.Node, key string, value int) {
 			v.Value = valStr
 			v.HeadComment, v.LineComment, v.FootComment = head, line, foot
 			updated = true
-			break
+			// NOTE: don't break; update all occurrences in the AST so any fallback that
+			// happens to serialize from nodes won't leave mixed values.
 		}
 	}
 	if !updated {
@@ -216,6 +280,7 @@ func SetScalarInt(mapNode *yaml.Node, key string, value int) {
 		return
 	}
 
+	// Ensure our logical ordered map is updated
 	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil {
 		indexMappingHandles(st, docHN.Content[0], nil)
 	}
@@ -223,17 +288,19 @@ func SetScalarInt(mapNode *yaml.Node, key string, value int) {
 	if !ok {
 		return
 	}
+	// Update the LAST occurrence in ordered map so "last wins" semantics hold.
 	st.ordered = setIntAtPath(st.ordered, path, key, value)
 }
 
-// Internal helpers
+// --------------------------------------------------------------------------------------
+// Internal helpers (ordered-map + indices + byte surgery)
+// --------------------------------------------------------------------------------------
 
 func ensureOrderedPath(ms gyaml.MapSlice, keys ...string) gyaml.MapSlice {
 	if len(keys) == 0 {
 		return ms
 	}
 	k := keys[0]
-
 	for i := range ms {
 		if keyEquals(ms[i].Key, k) {
 			sub, _ := ms[i].Value.(gyaml.MapSlice)
@@ -246,9 +313,10 @@ func ensureOrderedPath(ms gyaml.MapSlice, keys ...string) gyaml.MapSlice {
 	return ms
 }
 
+// Set the LAST occurrence if duplicates exist; else append.
 func setIntAtPath(ms gyaml.MapSlice, path []string, key string, val int) gyaml.MapSlice {
 	if len(path) == 0 {
-		for i := range ms {
+		for i := len(ms) - 1; i >= 0; i-- {
 			if keyEquals(ms[i].Key, key) {
 				ms[i].Value = val
 				return ms
@@ -288,7 +356,6 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 		return
 	}
 	st.subPathByHN[n] = append([]string(nil), cur...)
-
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		k := n.Content[i]
 		v := n.Content[i+1]
@@ -300,6 +367,503 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 		}
 	}
 }
+
+// ----- Byte indices from original parse -----
+
+func indexPositions(st *docState, n *yaml.Node, cur []string) {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return
+	}
+	// The indent for keys inside this mapping is the Column-1 of any key under it.
+	// We'll discover it while iterating keys below.
+	mapPath := joinPath(cur)
+	mi := st.mapIndex[mapPath]
+	if mi == nil {
+		mi = &mapInfo{indent: 0, lastLineEnd: 0, hasAnyKey: false, originalPath: true}
+		st.mapIndex[mapPath] = mi
+	}
+
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		k := n.Content[i]
+		v := n.Content[i+1]
+		if k.Kind != yaml.ScalarNode {
+			continue
+		}
+		key := k.Value
+
+		if k.Column > 0 && mi.indent == 0 && !(len(cur) == 0 && k.Column-1 == 0) {
+			// Record indent from the first seen key (except the very top where 0 is valid)
+			mi.indent = k.Column - 1
+		}
+		if len(cur) == 0 {
+			// top-level keys have indent 0
+			mi.indent = 0
+		}
+
+		// For scalars, we can anchor at the value line.
+		valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
+		if valStart >= 0 && valStart < len(st.original) {
+			valEnd := findScalarEndOnLine(st.original, valStart)
+			lineEnd := findLineEnd(st.original, valStart)
+
+			pk := makePathKey(cur, key)
+			st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+				keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
+				valStart:     valStart,
+				valEnd:       valEnd,
+				lineEnd:      lineEnd,
+			})
+
+			// Track last line in this mapping to attach future insertions
+			if lineEnd > mi.lastLineEnd {
+				mi.lastLineEnd = lineEnd
+			}
+			mi.hasAnyKey = true
+		}
+
+		// Recurse for nested mapping and extend the parent's lastLineEnd to the child's end.
+		if v.Kind == yaml.MappingNode {
+			childPath := append(cur, key)
+			indexPositions(st, v, childPath)
+			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > mi.lastLineEnd {
+				mi.lastLineEnd = childMi.lastLineEnd
+			}
+		}
+	}
+}
+
+// ----- Byte-surgical marshal -----
+
+type patch struct {
+	start int
+	end   int
+	data  []byte
+	seq   int // stable order for equal start
+}
+
+func marshalBySurgery(
+	original []byte,
+	current gyaml.MapSlice,
+	originalOrdered gyaml.MapSlice,
+	mapIdx map[string]*mapInfo,
+	valIdx map[string][]valueOcc,
+	baseIndent int,
+) ([]byte, bool) {
+	if len(original) == 0 {
+		// No original content to patch
+		return nil, false
+	}
+
+	// If the logical shape changed (e.g., scalar -> mapping via EnsurePath), surgery is unsafe.
+	if hasShapeChange(originalOrdered, current) {
+		return nil, false
+	}
+
+	// Detect changes & build patches
+	var patches []patch
+	seq := 0
+	for ok := range []int{0} {
+		_ = ok                             // keep the block to allow early returns neatly
+		mutableMI := cloneMapIndex(mapIdx) // local copy to advance insertion anchors
+
+		// 1) Replace ints that changed (and existed originally)
+		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx)
+		if !replaceOK {
+			return nil, false
+		}
+		for _, p := range replPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
+
+		// 2) Remove duplicates in original (keep LAST occurrence)
+		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx)
+		if !dupPatchesOK {
+			return nil, false
+		}
+		for _, p := range dupPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
+
+		// 3) Insert NEW integer keys (only when mapping existed & had at least one key)
+		insertOK, insertPatches := buildInsertPatches(original, current, originalOrdered, mutableMI, baseIndent)
+		if !insertOK {
+			return nil, false
+		}
+		for _, p := range insertPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
+	}
+
+	if len(patches) == 0 {
+		// Nothing changed (or everything was already identical)
+		return original, true
+	}
+
+	// Ensure patches don't have bad overlaps (insertion at same point is OK)
+	sort.SliceStable(patches, func(i, j int) bool {
+		if patches[i].start == patches[j].start {
+			if patches[i].end == patches[j].end {
+				return patches[i].seq < patches[j].seq
+			}
+			return patches[i].end < patches[j].end
+		}
+		return patches[i].start < patches[j].start
+	})
+	for i := 1; i < len(patches); i++ {
+		prev := patches[i-1]
+		cur := patches[i]
+		// overlapping destructive ranges not allowed
+		if prev.end > cur.start {
+			// If both are insertions at the same point (start==end), it's fine; else bail out
+			if !(prev.start == prev.end && cur.start == cur.end && prev.start == cur.start) {
+				return nil, false
+			}
+		}
+	}
+
+	// Apply patches
+	var out bytes.Buffer
+	cursor := 0
+	for _, p := range patches {
+		if p.start < cursor || p.end < p.start || p.end > len(original) {
+			return nil, false
+		}
+		out.Write(original[cursor:p.start])
+		out.Write(p.data)
+		cursor = p.end
+	}
+	out.Write(original[cursor:])
+	return out.Bytes(), true
+}
+
+func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
+	var patches []patch
+	var walk func(ms gyaml.MapSlice, path []string) bool
+	walk = func(ms gyaml.MapSlice, path []string) bool {
+		for _, it := range ms {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			switch v := it.Value.(type) {
+			case gyaml.MapSlice:
+				if !walk(v, append(path, k)) {
+					return false
+				}
+			case int:
+				pk := makePathKey(path, k)
+				occs := valIdx[pk]
+				if len(occs) == 0 {
+					// Key didn't exist originally at this path (it will be handled by insertion)
+					continue
+				}
+				// Replace the LAST occurrence (YAML semantics: last wins)
+				last := occs[len(occs)-1]
+				newVal := []byte(fmt.Sprintf("%d", v))
+				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
+				// Avoid churn if identical
+				if bytes.Equal(oldTok, newVal) {
+					continue
+				}
+				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newVal})
+			default:
+				// We only byte-patch ints; anything else is left untouched by surgery
+				continue
+			}
+		}
+		return true
+	}
+	if !walk(current, nil) {
+		return false, nil
+	}
+	return true, patches
+}
+
+func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
+	var patches []patch
+	// For each path+key that had duplicates originally, remove all but the last line
+	for _, occs := range valIdx {
+		if len(occs) <= 1 {
+			continue
+		}
+		for i := 0; i < len(occs)-1; i++ {
+			o := occs[i]
+			// Delete the whole line (from line start to line end + 1)
+			start := o.keyLineStart
+			end := o.lineEnd
+			// If the file had a newline, include it in deletion so we don't leave blank lines
+			if end < len(original) && original[end] == '\n' {
+				end++
+			}
+			patches = append(patches, patch{start: start, end: end, data: []byte{}})
+		}
+	}
+	return true, patches
+}
+
+func buildInsertPatches(
+	original []byte,
+	current gyaml.MapSlice,
+	originalOrdered gyaml.MapSlice,
+	mapIdx map[string]*mapInfo,
+	baseIndent int,
+) (bool, []patch) {
+	var patches []patch
+
+	// Build a quick set of original keys per path for "is new?" checks
+	origKeys := map[string]map[string]struct{}{}
+	var collect func(ms gyaml.MapSlice, path []string)
+	collect = func(ms gyaml.MapSlice, path []string) {
+		if origKeys[joinPath(path)] == nil {
+			origKeys[joinPath(path)] = map[string]struct{}{}
+		}
+		for _, it := range ms {
+			if k, ok := it.Key.(string); ok {
+				origKeys[joinPath(path)][k] = struct{}{}
+				if sub, ok2 := it.Value.(gyaml.MapSlice); ok2 {
+					collect(sub, append(path, k))
+				}
+			}
+		}
+	}
+	collect(originalOrdered, nil)
+
+	// Walk current and insert new ints at the end of their mapping
+	var walk func(ms gyaml.MapSlice, path []string) bool
+	walk = func(ms gyaml.MapSlice, path []string) bool {
+		mpath := joinPath(path)
+		for _, it := range ms {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			switch v := it.Value.(type) {
+			case gyaml.MapSlice:
+				if !walk(v, append(path, k)) {
+					return false
+				}
+			case int:
+				// New key?
+				if _, existed := origKeys[mpath][k]; !existed {
+					mi := mapIdx[mpath]
+					// Need an existing mapping anchor line to attach insertions to
+					if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+						// No safe place to insert bytes → fall back
+						return false
+					}
+					// Indent for keys inside this mapping.
+					indent := mi.indent
+					// If indent wasn't captured, approximate from depth * baseIndent
+					if indent == 0 && len(path) > 0 {
+						indent = baseIndent * len(path)
+					}
+					line := fmt.Sprintf("%s%s: %d\n", strings.Repeat(" ", indent), k, v)
+
+					insertPos := mi.lastLineEnd + 1 // right after the last line (start of next line)
+					if insertPos < 0 || insertPos > len(original) {
+						return false
+					}
+
+					// If the anchor line had no trailing newline (EOF case), ensure the new key starts on a new line.
+					if mi.lastLineEnd >= 0 {
+						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
+							line = "\n" + line
+						}
+					}
+
+					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
+					// Advance the local anchor so multiple insertions chain in order
+					mi.lastLineEnd = insertPos + len(line) - 1
+					mapIdx[mpath] = mi
+				}
+			default:
+				continue
+			}
+		}
+		return true
+	}
+	if !walk(current, nil) {
+		return false, nil
+	}
+	return true, patches
+}
+
+// ----- Small utilities for indices and scanning -----
+
+func cloneMapSlice(ms gyaml.MapSlice) gyaml.MapSlice {
+	out := make(gyaml.MapSlice, 0, len(ms))
+	for _, it := range ms {
+		var v interface{}
+		switch vv := it.Value.(type) {
+		case gyaml.MapSlice:
+			v = cloneMapSlice(vv)
+		default:
+			v = vv
+		}
+		out = append(out, gyaml.MapItem{Key: it.Key, Value: v})
+	}
+	return out
+}
+
+func cloneMapIndex(in map[string]*mapInfo) map[string]*mapInfo {
+	out := make(map[string]*mapInfo, len(in))
+	for k, v := range in {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+func cloneValueIndex(in map[string][]valueOcc) map[string][]valueOcc {
+	out := make(map[string][]valueOcc, len(in))
+	for k, v := range in {
+		cp := make([]valueOcc, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+const pathSep = "\x00"
+
+func joinPath(path []string) string {
+	if len(path) == 0 {
+		return ""
+	}
+	return strings.Join(path, pathSep)
+}
+
+func makePathKey(path []string, key string) string {
+	if len(path) == 0 {
+		return key
+	}
+	return strings.Join(append(append([]string{}, path...), key), pathSep)
+}
+
+func buildLineOffsets(b []byte) []int {
+	offsets := []int{0}
+	for i, c := range b {
+		if c == '\n' {
+			if i+1 < len(b) {
+				offsets = append(offsets, i+1)
+			}
+		}
+	}
+	return offsets
+}
+
+func offsetFor(lineOffsets []int, line, col int) int {
+	// yaml.v3 uses 1-based line/column
+	if line <= 0 || col <= 0 || line > len(lineOffsets) {
+		return -1
+	}
+	return lineOffsets[line-1] + (col - 1)
+}
+
+func lineStartOffset(lineOffsets []int, line int) int {
+	if line <= 0 || line > len(lineOffsets) {
+		return 0
+	}
+	return lineOffsets[line-1]
+}
+
+func findLineEnd(b []byte, from int) int {
+	if from < 0 {
+		return 0
+	}
+	for i := from; i < len(b); i++ {
+		if b[i] == '\n' {
+			return i
+		}
+	}
+	// no newline; pretend the "end" sits at len-1 so 'end+1' is safe-checked by callers
+	return len(b) - 1
+}
+
+// findScalarEndOnLine returns the end (exclusive) of the scalar token that starts at 'pos',
+// scanning only within the current line. This is conservative and aims to handle:
+//   - bare ints: -?[0-9_]+
+//   - quoted scalars: '...' or "..." (we'll stop at the closing quote on this line)
+//   - otherwise, we stop at the first '#' or end-of-line, trimming trailing spaces
+func findScalarEndOnLine(b []byte, pos int) int {
+	if pos < 0 || pos >= len(b) {
+		return pos
+	}
+	i := pos
+	// Determine line end
+	le := findLineEnd(b, pos)
+	if le < pos {
+		le = len(b)
+	}
+	// If quoted
+	if b[i] == '\'' {
+		i++ // after opening '
+		for i <= le {
+			if i == le { // hit end of line
+				return le
+			}
+			if b[i] == '\'' {
+				// YAML single quotes escape as ''
+				if i+1 <= le && b[i+1] == '\'' {
+					i += 2
+					continue
+				}
+				return i + 1 // include closing quote
+			}
+			i++
+		}
+		return le
+	}
+	if b[i] == '"' {
+		i++ // after opening "
+		esc := false
+		for i <= le {
+			if i == le {
+				return le
+			}
+			if esc {
+				esc = false
+				i++
+				continue
+			}
+			if b[i] == '\\' {
+				esc = true
+				i++
+				continue
+			}
+			if b[i] == '"' {
+				return i + 1
+			}
+			i++
+		}
+		return le
+	}
+
+	// Bare token: read until comment or newline
+	j := pos
+	for j < le {
+		if b[j] == '#' {
+			break
+		}
+		j++
+	}
+	// Trim trailing spaces before comment/hash
+	k := j
+	for k > pos && (b[k-1] == ' ' || b[k-1] == '\t') {
+		k--
+	}
+	return k
+}
+
+// --------------------------------------------------------------------------------------
+// Indent / sequence detection (unchanged)
+// --------------------------------------------------------------------------------------
 
 // detectIndentAndSequence returns the base indent, and whether sequences that are values
 // of mapping keys are indented one level (true) or "indentless" (false).
@@ -340,7 +904,7 @@ func detectIndentAndSequence(b []byte) (int, bool) {
 	if votes < 0 {
 		return indent, false
 	}
-	// no evidence either way: default to indented sequences (common in K8s/Helm repos)
+	// default to indented sequences (common in K8s/Helm repos)
 	return indent, true
 }
 
@@ -349,10 +913,9 @@ func isBlankOrComment(ln []byte) bool {
 	return len(t) == 0 || t[0] == '#'
 }
 
-// endsWithMappingKey returns true if the line is a block mapping key of the form "key:" possibly
-// followed by spaces and/or a comment.
+// endsWithMappingKey returns true if the line is a block mapping key of the form "key:"
+// possibly followed by spaces and/or a comment.
 func endsWithMappingKey(ln []byte) bool {
-	// ignore flow/inline cases; we just need the common block "key:" form
 	idx := bytes.IndexByte(ln, ':')
 	if idx < 0 {
 		return false
@@ -420,4 +983,44 @@ func leadingSpaces(line []byte) int {
 		i++
 	}
 	return i
+}
+
+// --------------------------------------------------------------------------------------
+// Fallback helpers: shape-change detection + dedupe
+// --------------------------------------------------------------------------------------
+
+// hasShapeChange returns true if any key flips between "mapping" and "non-mapping"
+// comparing originalOrdered vs current (only along keys that existed originally).
+func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
+	om := lastMap(originalOrdered)
+	cm := lastMap(current)
+	for k, ov := range om {
+		cv, ok := cm[k]
+		if !ok {
+			// key removed or moved; our API doesn't remove keys, so ignore
+			continue
+		}
+		_, oIsMap := ov.(gyaml.MapSlice)
+		_, cIsMap := cv.(gyaml.MapSlice)
+		if oIsMap != cIsMap {
+			return true
+		}
+		if oIsMap && cIsMap {
+			if hasShapeChange(ov.(gyaml.MapSlice), cv.(gyaml.MapSlice)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// lastMap converts a MapSlice to a map[string]interface{} keeping the LAST occurrence.
+func lastMap(ms gyaml.MapSlice) map[string]interface{} {
+	m := make(map[string]interface{}, len(ms))
+	for _, it := range ms {
+		if k, ok := it.Key.(string); ok {
+			m[k] = it.Value
+		}
+	}
+	return m
 }
