@@ -2,9 +2,11 @@ package yamledit
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1333,4 +1335,161 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------
+// JSON Patch tests
+// ---------------------------
+
+func TestJSONPatch_AddEnvVarAtBasePath(t *testing.T) {
+	in := []byte(`java-service:
+  envs:
+    EXISTING_KEY: existing_value
+  replicas: 3
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	patch := []byte(`[{"op":"add","path":"/NEW_KEY","value":"new_value"}]`)
+	if err := ApplyJSONPatchAtPathBytes(doc, patch, []string{"java-service", "envs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(out)
+	if getLineContaining(s, "EXISTING_KEY:") != "    EXISTING_KEY: existing_value" {
+		t.Fatalf("existing line churned:\n%s", s)
+	}
+	nl := getLineContaining(s, "NEW_KEY:")
+	if !(nl == "    NEW_KEY: 'new_value'" || nl == `    NEW_KEY: "new_value"`) {
+		t.Fatalf("NEW_KEY not appended with quoting; got: %q\nfull:\n%s", nl, s)
+	}
+}
+
+func TestJSONPatch_ReplaceInt(t *testing.T) {
+	in := []byte(`java-service:
+  replicas: 3
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	target := EnsurePath(doc, "java-service")
+	patch := []byte(`[{"op":"replace","path":"/replicas","value":5}]`)
+	if err := ApplyJSONPatchBytes(target, patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if getLineContaining(string(out), "replicas:") != "  replicas: 5" {
+		t.Fatalf("replicas not replaced, got:\n%s", out)
+	}
+}
+
+func TestJSONPatch_RemoveKey(t *testing.T) {
+	in := []byte(`svc:
+  A: "1"
+  B: "2"
+`)
+	doc, _ := Parse(in)
+	target := EnsurePath(doc, "svc")
+	patch := []byte(`[{"op":"remove","path":"/A"}]`)
+	if err := ApplyJSONPatchBytes(target, patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	out, _ := Marshal(doc)
+	if strings.Contains(string(out), "A:") {
+		t.Fatalf("A should be removed:\n%s", out)
+	}
+	if getLineContaining(string(out), "B:") != `  B: "2"` {
+		t.Fatalf("B changed:\n%s", out)
+	}
+}
+
+func TestJSONPatch_TestOp(t *testing.T) {
+	in := []byte(`cfg:
+  enabled: false
+`)
+	doc, _ := Parse(in)
+	target := EnsurePath(doc, "cfg")
+	ok := []byte(`[{"op":"test","path":"/enabled","value":false}]`)
+	if err := ApplyJSONPatchBytes(target, ok); err != nil {
+		t.Fatalf("test should pass, got: %v", err)
+	}
+	bad := []byte(`[{"op":"test","path":"/enabled","value":true}]`)
+	if err := ApplyJSONPatchBytes(target, bad); err == nil {
+		t.Fatalf("test should fail")
+	}
+}
+
+func TestJSONPatch_ArrayAddTriggersFallback(t *testing.T) {
+	in := []byte(`items:
+- a
+- b
+`)
+	doc, _ := Parse(in)
+	patch := []byte(`[{"op":"add","path":"/items/-","value":"c"}]`)
+	if err := ApplyJSONPatchBytes(doc, patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	out, _ := Marshal(doc)
+	s := string(out)
+	if !strings.Contains(s, "- c") {
+		t.Fatalf("expected array append, got:\n%s", s)
+	}
+}
+
+func TestJSONPatch_WrappersWithDecodePatch(t *testing.T) {
+	in := []byte(`svc:
+  port: 8080
+`)
+	doc, _ := Parse(in)
+	pb := []byte(`[{"op":"replace","path":"/port","value":9090}]`)
+	var arr []map[string]any
+	_ = json.Unmarshal(pb, &arr) // ensure valid
+
+	// Use jsonpatch.Patch wrapper (if available)
+	p, err := jsonpatch.DecodePatch(pb)
+	if err != nil {
+		t.Fatalf("DecodePatch: %v", err)
+	}
+	if err := ApplyJSONPatch(EnsurePath(doc, "svc"), p); err != nil {
+		t.Fatalf("ApplyJSONPatch: %v", err)
+	}
+	out, _ := Marshal(doc)
+	if getLineContaining(string(out), "port:") != "  port: 9090" {
+		t.Fatalf("replace failed:\n%s", out)
+	}
+}
+
+func TestJSONPatch_ConcurrentMarshalNoDeadlock(t *testing.T) {
+	in := []byte(`svc:
+  port: 8080
+  name: "api"
+`)
+	doc, _ := Parse(in)
+	svc := EnsurePath(doc, "svc")
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		patch := []byte(`[{"op":"replace","path":"/port","value":9090}]`)
+		if err := ApplyJSONPatchBytes(svc, patch); err != nil {
+			t.Errorf("patch: %v", err)
+		}
+	}()
+
+	// Concurrent marshal while patch is applying
+	for i := 0; i < 1000; i++ {
+		if _, err := Marshal(doc); err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+	}
+	<-done
 }
