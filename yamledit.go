@@ -35,6 +35,9 @@ type docState struct {
 
 	// Scalar value positions (original) keyed by path + key (we store all occurrences to handle dups)
 	valueOccByPathKey map[string][]valueOcc
+
+	// explicit deletions requested (path\0key)
+	toDelete map[string]struct{}
 }
 
 // Information about a mapping block in the original YAML
@@ -112,6 +115,7 @@ func Parse(data []byte) (*yaml.Node, error) {
 		lineOffsets:       buildLineOffsets(data),
 		mapIndex:          map[string]*mapInfo{},
 		valueOccByPathKey: map[string][]valueOcc{},
+		toDelete:          map[string]struct{}{},
 	}
 
 	// Decode into ordered map and capture comments; detect indent and sequence style
@@ -162,14 +166,19 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	mapIdx := cloneMapIndex(st.mapIndex)
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
 	origOrdered := cloneMapSlice(st.origOrdered)
+	delSet := make(map[string]struct{}, len(st.toDelete))
+	for k := range st.toDelete {
+		delSet[k] = struct{}{}
+	}
 	st.mu.RUnlock()
 
 	// Attempt byte-surgical patching
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent)
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent, delSet)
 	if okPatch {
 		return out, nil
 	}
 
+	// Fallback: structured encode (still preserves comments/order/indent)
 	var buf bytes.Buffer
 	enc := gyaml.NewEncoder(
 		&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments),
@@ -183,20 +192,64 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 }
 
 // EnsurePath returns a mapping node for the nested keys (creates when missing).
-func EnsurePath(doc *yaml.Node, first string, rest ...string) *yaml.Node {
-	if doc == nil || doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+// It now accepts either a root DocumentNode or a MappingNode as the starting point.
+func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
+	if node == nil {
 		return nil
 	}
 
-	st, _ := lookup(doc)
-	if st != nil {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-	}
-
-	cur := doc.Content[0]
 	keys := append([]string{first}, rest...)
 
+	// Resolve state + starting mapping node.
+	var (
+		st       *docState
+		startMap *yaml.Node
+		basePath []string // YAML path of startMap from the root (if known)
+		ownsLock bool
+	)
+
+	switch node.Kind {
+	case yaml.DocumentNode:
+		// Start from document root mapping
+		if len(node.Content) == 0 || node.Content[0].Kind != yaml.MappingNode {
+			return nil
+		}
+		startMap = node.Content[0]
+		if s, ok := lookup(node); ok {
+			st = s
+		}
+
+	case yaml.MappingNode:
+		// Start from a mapping node inside the doc
+		startMap = node
+		// Find the docState that knows this mapping handle
+		regMu.Lock()
+		for _, s := range reg {
+			if p, ok := s.subPathByHN[startMap]; ok {
+				st = s
+				basePath = append([]string(nil), p...) // copy
+				break
+			}
+		}
+		regMu.Unlock()
+
+	default:
+		return nil
+	}
+
+	// Lock state if present
+	if st != nil {
+		st.mu.Lock()
+		ownsLock = true
+		defer func() {
+			if ownsLock {
+				st.mu.Unlock()
+			}
+		}()
+	}
+
+	// Walk/construct from startMap
+	cur := startMap
 	for _, k := range keys {
 		var found *yaml.Node
 		for i := 0; i+1 < len(cur.Content); i += 2 {
@@ -218,14 +271,20 @@ func EnsurePath(doc *yaml.Node, first string, rest ...string) *yaml.Node {
 			*found = *repl
 		}
 		cur = found
+
+		// Keep handle → path mapping up to date for new/converted nodes
+		if st != nil {
+			segPath := append(append([]string(nil), basePath...), k)
+			st.subPathByHN[cur] = append([]string(nil), segPath...)
+			basePath = segPath
+		}
 	}
 
+	// Keep ordered (logical) view in sync
 	if st != nil {
-		// keep our ordered (logical) view in sync
-		st.ordered = ensureOrderedPath(st.ordered, keys...)
-		st.subPathByHN[cur] = append([]string(nil), keys...)
-		// Note: indices for surgical edit (mapIndex/valueOccByPathKey) are based on the original file.
-		// Newly-created path doesn't exist in original bytes, so surgical editing will auto-fallback.
+		fullPath := append([]string(nil), st.subPathByHN[startMap]...)
+		fullPath = append(fullPath, keys...)
+		st.ordered = ensureOrderedPath(st.ordered, fullPath...)
 	}
 
 	return cur
@@ -290,6 +349,185 @@ func SetScalarInt(mapNode *yaml.Node, key string, value int) {
 	}
 	// Update the LAST occurrence in ordered map so "last wins" semantics hold.
 	st.ordered = setIntAtPath(st.ordered, path, key, value)
+	// if user had previously requested delete for this key, cancel it (last write wins)
+	delete(st.toDelete, makePathKey(path, key))
+}
+
+// SetScalarString sets a string value under the mapping node.
+func SetScalarString(mapNode *yaml.Node, key, value string) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode {
+		return
+	}
+
+	var st *docState
+	var docHN *yaml.Node
+	regMu.Lock()
+	for doc, s := range reg {
+		if _, ok := s.subPathByHN[mapNode]; ok {
+			st = s
+			docHN = doc
+			break
+		}
+	}
+	regMu.Unlock()
+
+	if st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+	}
+
+	updated := false
+	for i := 0; i+1 < len(mapNode.Content); i += 2 {
+		k := mapNode.Content[i]
+		if k.Kind == yaml.ScalarNode && k.Value == key {
+			v := mapNode.Content[i+1]
+			head, line, foot := v.HeadComment, v.LineComment, v.FootComment
+			v.Kind = yaml.ScalarNode
+			v.Tag = "!!str"
+			v.Value = value
+			v.HeadComment, v.LineComment, v.FootComment = head, line, foot
+			updated = true
+		}
+	}
+	if !updated {
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+		valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
+		mapNode.Content = append(mapNode.Content, keyNode, valNode)
+	}
+
+	if st == nil {
+		return
+	}
+
+	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil {
+		indexMappingHandles(st, docHN.Content[0], nil)
+	}
+	path, ok := st.subPathByHN[mapNode]
+	if !ok {
+		return
+	}
+	st.ordered = setStringAtPath(st.ordered, path, key, value)
+	delete(st.toDelete, makePathKey(path, key)) // string write cancels pending deletion
+}
+
+// SetScalarBool sets a boolean value under the mapping node.
+// Byte-surgical replacement writes canonical YAML booleans ("true"/"false").
+func SetScalarBool(mapNode *yaml.Node, key string, value bool) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode {
+		return
+	}
+
+	var st *docState
+	var docHN *yaml.Node
+	regMu.Lock()
+	for doc, s := range reg {
+		if _, ok := s.subPathByHN[mapNode]; ok {
+			st = s
+			docHN = doc
+			break
+		}
+	}
+	regMu.Unlock()
+
+	if st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+	}
+
+	valStr := "false"
+	if value {
+		valStr = "true"
+	}
+
+	updated := false
+	for i := 0; i+1 < len(mapNode.Content); i += 2 {
+		k := mapNode.Content[i]
+		if k.Kind == yaml.ScalarNode && k.Value == key {
+			v := mapNode.Content[i+1]
+			head, line, foot := v.HeadComment, v.LineComment, v.FootComment
+			v.Kind = yaml.ScalarNode
+			v.Tag = "!!bool"
+			v.Value = valStr
+			v.HeadComment, v.LineComment, v.FootComment = head, line, foot
+			updated = true
+		}
+	}
+	if !updated {
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+		valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: valStr}
+		mapNode.Content = append(mapNode.Content, keyNode, valNode)
+	}
+
+	if st == nil {
+		return
+	}
+
+	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil {
+		indexMappingHandles(st, docHN.Content[0], nil)
+	}
+	path, ok := st.subPathByHN[mapNode]
+	if !ok {
+		return
+	}
+	st.ordered = setBoolAtPath(st.ordered, path, key, value)
+	delete(st.toDelete, makePathKey(path, key)) // write cancels pending deletion
+}
+
+// DeleteKey removes all occurrences of 'key' under 'mapNode'.
+// Surgical deletion removes the complete lines for the key’s occurrences.
+// If surgery is unsafe/unavailable, Marshal() falls back to a structured re-encode.
+func DeleteKey(mapNode *yaml.Node, key string) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode {
+		return
+	}
+
+	var st *docState
+	var docHN *yaml.Node
+	regMu.Lock()
+	for doc, s := range reg {
+		if _, ok := s.subPathByHN[mapNode]; ok {
+			st = s
+			docHN = doc
+			break
+		}
+	}
+	regMu.Unlock()
+
+	if st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+	}
+
+	// Remove all pairs from the AST for the mapping node.
+	nc := make([]*yaml.Node, 0, len(mapNode.Content))
+	for i := 0; i+1 < len(mapNode.Content); i += 2 {
+		k := mapNode.Content[i]
+		v := mapNode.Content[i+1]
+		if k.Kind == yaml.ScalarNode && k.Value == key {
+			// drop the pair (k, v)
+			_ = v
+			continue
+		}
+		nc = append(nc, k, v)
+	}
+	mapNode.Content = nc
+
+	if st == nil {
+		return
+	}
+
+	// Ensure we have a path recorded for this handle
+	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil {
+		indexMappingHandles(st, docHN.Content[0], nil)
+	}
+	path, ok := st.subPathByHN[mapNode]
+	if !ok {
+		return
+	}
+
+	// Update ordered map and mark deletion for surgery.
+	st.ordered, _ = deleteKeyAtPath(st.ordered, path, key)
+	st.toDelete[makePathKey(path, key)] = struct{}{}
 }
 
 // --------------------------------------------------------------------------------------
@@ -338,6 +576,85 @@ func setIntAtPath(ms gyaml.MapSlice, path []string, key string, val int) gyaml.M
 	sub := setIntAtPath(gyaml.MapSlice{}, path[1:], key, val)
 	ms = append(ms, gyaml.MapItem{Key: head, Value: sub})
 	return ms
+}
+
+// string version mirrors int semantics (last occurrence wins; append if missing)
+func setStringAtPath(ms gyaml.MapSlice, path []string, key, val string) gyaml.MapSlice {
+	if len(path) == 0 {
+		for i := len(ms) - 1; i >= 0; i-- {
+			if keyEquals(ms[i].Key, key) {
+				ms[i].Value = val
+				return ms
+			}
+		}
+		ms = append(ms, gyaml.MapItem{Key: key, Value: val})
+		return ms
+	}
+	head := path[0]
+	for i := range ms {
+		if keyEquals(ms[i].Key, head) {
+			sub, _ := ms[i].Value.(gyaml.MapSlice)
+			sub = setStringAtPath(sub, path[1:], key, val)
+			ms[i].Value = sub
+			return ms
+		}
+	}
+	sub := setStringAtPath(gyaml.MapSlice{}, path[1:], key, val)
+	ms = append(ms, gyaml.MapItem{Key: head, Value: sub})
+	return ms
+}
+
+func setBoolAtPath(ms gyaml.MapSlice, path []string, key string, val bool) gyaml.MapSlice {
+	if len(path) == 0 {
+		for i := len(ms) - 1; i >= 0; i-- {
+			if keyEquals(ms[i].Key, key) {
+				ms[i].Value = val
+				return ms
+			}
+		}
+		ms = append(ms, gyaml.MapItem{Key: key, Value: val})
+		return ms
+	}
+	head := path[0]
+	for i := range ms {
+		if keyEquals(ms[i].Key, head) {
+			sub, _ := ms[i].Value.(gyaml.MapSlice)
+			sub = setBoolAtPath(sub, path[1:], key, val)
+			ms[i].Value = sub
+			return ms
+		}
+	}
+	sub := setBoolAtPath(gyaml.MapSlice{}, path[1:], key, val)
+	ms = append(ms, gyaml.MapItem{Key: head, Value: sub})
+	return ms
+}
+
+// delete a key at path (remove all occurrences)
+func deleteKeyAtPath(ms gyaml.MapSlice, path []string, key string) (gyaml.MapSlice, bool) {
+	if len(path) == 0 {
+		out := make(gyaml.MapSlice, 0, len(ms))
+		removed := false
+		for _, it := range ms {
+			if keyEquals(it.Key, key) {
+				removed = true
+				continue
+			}
+			out = append(out, it)
+		}
+		return out, removed
+	}
+	head := path[0]
+	for i := range ms {
+		if keyEquals(ms[i].Key, head) {
+			if sub, ok := ms[i].Value.(gyaml.MapSlice); ok {
+				newSub, rem := deleteKeyAtPath(sub, path[1:], key)
+				ms[i].Value = newSub
+				return ms, rem
+			}
+			return ms, false
+		}
+	}
+	return ms, false
 }
 
 func keyEquals(k interface{}, want string) bool {
@@ -448,6 +765,7 @@ func marshalBySurgery(
 	mapIdx map[string]*mapInfo,
 	valIdx map[string][]valueOcc,
 	baseIndent int,
+	deletions map[string]struct{},
 ) ([]byte, bool) {
 	if len(original) == 0 {
 		// No original content to patch
@@ -466,7 +784,7 @@ func marshalBySurgery(
 		_ = ok                             // keep the block to allow early returns neatly
 		mutableMI := cloneMapIndex(mapIdx) // local copy to advance insertion anchors
 
-		// 1) Replace ints that changed (and existed originally)
+		// 1) Replace ints/strings that changed (and existed originally)
 		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx)
 		if !replaceOK {
 			return nil, false
@@ -477,8 +795,8 @@ func marshalBySurgery(
 			patches = append(patches, p)
 		}
 
-		// 2) Remove duplicates in original (keep LAST occurrence)
-		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx)
+		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion
+		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx, deletions)
 		if !dupPatchesOK {
 			return nil, false
 		}
@@ -488,12 +806,23 @@ func marshalBySurgery(
 			patches = append(patches, p)
 		}
 
-		// 3) Insert NEW integer keys (only when mapping existed & had at least one key)
+		// 3) Insert NEW keys (ints/strings) where safe
 		insertOK, insertPatches := buildInsertPatches(original, current, originalOrdered, mutableMI, baseIndent)
 		if !insertOK {
 			return nil, false
 		}
 		for _, p := range insertPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
+
+		// 4) Explicit deletions (remove all occurrences)
+		delOK, delPatches := buildDeletionPatches(original, deletions, valIdx)
+		if !delOK {
+			return nil, false
+		}
+		for _, p := range delPatches {
 			p.seq = seq
 			seq++
 			patches = append(patches, p)
@@ -572,6 +901,41 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 					continue
 				}
 				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newVal})
+
+			case string:
+				pk := makePathKey(path, k)
+				occs := valIdx[pk]
+				if len(occs) == 0 {
+					continue // new key; handled by insertion
+				}
+				last := occs[len(occs)-1]
+				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
+				newTok := stringReplacementToken(oldTok, v)
+				// Avoid churn if identical bytes
+				if bytes.Equal(oldTok, newTok) {
+					continue
+				}
+				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+
+			case bool:
+				pk := makePathKey(path, k)
+				occs := valIdx[pk]
+				if len(occs) == 0 {
+					continue // new key; handled by insertion
+				}
+				last := occs[len(occs)-1]
+				var newTok []byte
+				if v {
+					newTok = []byte("true")
+				} else {
+					newTok = []byte("false")
+				}
+				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
+				if bytes.Equal(oldTok, newTok) {
+					continue
+				}
+				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+
 			default:
 				// We only byte-patch ints; anything else is left untouched by surgery
 				continue
@@ -585,10 +949,14 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 	return true, patches
 }
 
-func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
+// Ignore duplicate-removal for keys that are explicitly deleted in this op (to avoid overlap).
+func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, ignore map[string]struct{}) (bool, []patch) {
 	var patches []patch
 	// For each path+key that had duplicates originally, remove all but the last line
-	for _, occs := range valIdx {
+	for pk, occs := range valIdx {
+		if _, skip := ignore[pk]; skip {
+			continue
+		}
 		if len(occs) <= 1 {
 			continue
 		}
@@ -664,8 +1032,32 @@ func buildInsertPatches(
 						indent = baseIndent * len(path)
 					}
 					line := fmt.Sprintf("%s%s: %d\n", strings.Repeat(" ", indent), k, v)
-
-					insertPos := mi.lastLineEnd + 1 // right after the last line (start of next line)
+					insertPos := mi.lastLineEnd + 1
+					if insertPos < 0 || insertPos > len(original) {
+						return false
+					}
+					if mi.lastLineEnd >= 0 {
+						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
+							line = "\n" + line
+						}
+					}
+					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
+					mi.lastLineEnd = insertPos + len(line) - 1
+					mapIdx[mpath] = mi
+				}
+			case string:
+				if _, existed := origKeys[mpath][k]; !existed {
+					mi := mapIdx[mpath]
+					if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+						return false
+					}
+					indent := mi.indent
+					if indent == 0 && len(path) > 0 {
+						indent = baseIndent * len(path)
+					}
+					valTok := quoteNewStringToken(v) // choose safe, stable quoting
+					line := fmt.Sprintf("%s%s: %s\n", strings.Repeat(" ", indent), k, valTok)
+					insertPos := mi.lastLineEnd + 1
 					if insertPos < 0 || insertPos > len(original) {
 						return false
 					}
@@ -682,6 +1074,34 @@ func buildInsertPatches(
 					mi.lastLineEnd = insertPos + len(line) - 1
 					mapIdx[mpath] = mi
 				}
+			case bool:
+				if _, existed := origKeys[mpath][k]; !existed {
+					mi := mapIdx[mpath]
+					if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+						return false
+					}
+					indent := mi.indent
+					if indent == 0 && len(path) > 0 {
+						indent = baseIndent * len(path)
+					}
+					valTok := "false"
+					if v {
+						valTok = "true"
+					}
+					line := fmt.Sprintf("%s%s: %s\n", strings.Repeat(" ", indent), k, valTok)
+					insertPos := mi.lastLineEnd + 1
+					if insertPos < 0 || insertPos > len(original) {
+						return false
+					}
+					if mi.lastLineEnd >= 0 {
+						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
+							line = "\n" + line
+						}
+					}
+					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
+					mi.lastLineEnd = insertPos + len(line) - 1
+					mapIdx[mpath] = mi
+				}
 			default:
 				continue
 			}
@@ -690,6 +1110,31 @@ func buildInsertPatches(
 	}
 	if !walk(current, nil) {
 		return false, nil
+	}
+	return true, patches
+}
+
+// explicit deletion patches for requested keys (remove whole lines for ALL occurrences)
+func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx map[string][]valueOcc) (bool, []patch) {
+	if len(deletions) == 0 {
+		return true, nil
+	}
+	var patches []patch
+	for pk := range deletions {
+		occs := valIdx[pk]
+		if len(occs) == 0 {
+			// Key didn’t exist in original as a scalar line → no surgical deletion to make.
+			// Not an error: fallback encoder will already have removed from the logical map.
+			continue
+		}
+		for _, o := range occs {
+			start := o.keyLineStart
+			end := o.lineEnd
+			if end < len(original) && original[end] == '\n' {
+				end++
+			}
+			patches = append(patches, patch{start: start, end: end, data: []byte{}})
+		}
 	}
 	return true, patches
 }
@@ -989,15 +1434,12 @@ func leadingSpaces(line []byte) int {
 // Fallback helpers: shape-change detection + dedupe
 // --------------------------------------------------------------------------------------
 
-// hasShapeChange returns true if any key flips between "mapping" and "non-mapping"
-// comparing originalOrdered vs current (only along keys that existed originally).
 func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
 	om := lastMap(originalOrdered)
 	cm := lastMap(current)
 	for k, ov := range om {
 		cv, ok := cm[k]
 		if !ok {
-			// key removed or moved; our API doesn't remove keys, so ignore
 			continue
 		}
 		_, oIsMap := ov.(gyaml.MapSlice)
@@ -1014,7 +1456,6 @@ func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
 	return false
 }
 
-// lastMap converts a MapSlice to a map[string]interface{} keeping the LAST occurrence.
 func lastMap(ms gyaml.MapSlice) map[string]interface{} {
 	m := make(map[string]interface{}, len(ms))
 	for _, it := range ms {
@@ -1023,4 +1464,69 @@ func lastMap(ms gyaml.MapSlice) map[string]interface{} {
 		}
 	}
 	return m
+}
+
+// --------------------------------------------------------------------------------------
+// string token helpers for surgical replacements/insertions
+// --------------------------------------------------------------------------------------
+
+var yamlBareDisallowed = map[string]struct{}{
+	"true": {}, "false": {}, "True": {}, "False": {},
+	"yes": {}, "no": {}, "Yes": {}, "No": {},
+	"on": {}, "off": {}, "On": {}, "Off": {},
+	"null": {}, "Null": {}, "NULL": {}, "~": {},
+}
+
+func isSafeBareString(s string) bool {
+	if _, bad := yamlBareDisallowed[s]; bad {
+		return false
+	}
+	if len(s) == 0 {
+		return false
+	}
+	// Disallow whitespace or YAML special chars that frequently need quoting
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '\n', ':', '#', '{', '}', '[', ']', ',', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`':
+			return false
+		}
+	}
+	return true
+}
+
+// Use existing quote style when replacing; if old token was bare but new is unsafe, add quotes.
+func stringReplacementToken(oldTok []byte, newVal string) []byte {
+	if len(oldTok) > 0 && oldTok[0] == '\'' {
+		// single-quoted → escape by doubling single quotes
+		return []byte("'" + strings.ReplaceAll(newVal, "'", "''") + "'")
+	}
+	if len(oldTok) > 0 && oldTok[0] == '"' {
+		return []byte(`"` + escapeDoubleQuotes(newVal) + `"`)
+	}
+	// Bare previously
+	if isSafeBareString(newVal) {
+		return []byte(newVal)
+	}
+	// default to double-quoted for safety
+	return []byte(`"` + escapeDoubleQuotes(newVal) + `"`)
+}
+
+// For new insertions, prefer single quotes (no escapes) if possible; otherwise double-quote.
+func quoteNewStringToken(s string) string {
+	if !strings.Contains(s, "'") && !strings.ContainsAny(s, "\n\r\t") {
+		return "'" + s + "'"
+	}
+	return `"` + escapeDoubleQuotes(s) + `"`
+}
+
+func escapeDoubleQuotes(s string) string {
+	// Keep it simple: escape backslash and double quote; also encode newlines/tabs
+	repl := strings.NewReplacer(
+		`\\`, `\\`,
+		`"`, `\"`,
+		"\n", `\n`,
+		"\r", `\r`,
+		"\t", `\t`,
+	)
+	return repl.Replace(s)
 }

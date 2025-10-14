@@ -949,6 +949,344 @@ func TestInsertNewKeyAtEOF_NoFinalNewline_SeparatesLine(t *testing.T) {
 	}
 }
 
+func TestSetScalarString_UpdatePreservesQuotes_Double(t *testing.T) {
+	in := []byte(`env:
+  GREETING: "hello"
+  port: 8080
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	SetScalarString(env, "GREETING", "hi")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := getLineContaining(string(out), "GREETING:")
+	want := `  GREETING: "hi"`
+	if got != want {
+		t.Fatalf("double-quote style should be preserved\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
+	}
+}
+
+func TestSetScalarString_UpdatePreservesQuotes_Single_WithEscapes(t *testing.T) {
+	in := []byte(`env:
+  NOTE: 'it works'
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	SetScalarString(env, "NOTE", "it's fine") // must escape as it''s
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := getLineContaining(string(out), "NOTE:")
+	want := `  NOTE: 'it''s fine'`
+	if got != want {
+		t.Fatalf("single-quote style/escaping not preserved\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
+	}
+}
+
+func TestSetScalarString_InsertNew_AppendsWithIndentAndQuotes(t *testing.T) {
+	in := []byte(`env:
+    A: 1
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	SetScalarString(env, "NEW", "v1")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Unchanged line should remain byte-identical
+	before := getLineContaining(string(in), "A:")
+	after := getLineContaining(string(out), "A:")
+	if before != after {
+		t.Fatalf("unchanged line churned:\nBEFORE: %q\nAFTER:  %q", before, after)
+	}
+
+	// New key appended with 4-space indent; value quoted (either 'v1' or "v1")
+	newLine := getLineContaining(string(out), "NEW:")
+	if !(newLine == `    NEW: 'v1'` || newLine == `    NEW: "v1"`) {
+		t.Fatalf("unexpected formatting for inserted string key; got: %q", newLine)
+	}
+
+	posA := lineIndexContaining(string(out), "A:")
+	posN := lineIndexContaining(string(out), "NEW:")
+	if !(posN > posA) {
+		t.Fatalf("NEW should be appended after A; A=%d NEW=%d\n%s", posA, posN, out)
+	}
+}
+
+func TestSetScalarBool_UpdateBare_PreservesOtherLines(t *testing.T) {
+	in := []byte(`cfg:
+  enabled: false  # feature gate
+  name: "svc"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg := EnsurePath(doc, "cfg")
+	SetScalarBool(cfg, "enabled", true)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Updated line keeps inline comment and base spacing; token becomes bare true
+	want := `  enabled: true  # feature gate`
+	got := getLineContaining(string(out), "enabled:")
+	if got != want {
+		t.Fatalf("bool update lost formatting/comment\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
+	}
+	// Unrelated quoted string unchanged
+	if getLineContaining(string(out), `name:`) != `  name: "svc"` {
+		t.Fatalf("unrelated line churned:\n%s", out)
+	}
+}
+
+func TestSetScalarBool_InsertNew_AppendsWithIndent(t *testing.T) {
+	in := []byte(`cfg:
+    a: 1
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg := EnsurePath(doc, "cfg")
+	SetScalarBool(cfg, "enabled", true)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// New key at 4-space indent
+	if getLineContaining(string(out), "enabled:") != `    enabled: true` {
+		t.Fatalf("expected 4-space indent for inserted bool; got:\n%s", out)
+	}
+	// a: 1 remains identical
+	before := getLineContaining(string(in), "a:")
+	after := getLineContaining(string(out), "a:")
+	if before != after {
+		t.Fatalf("unchanged line churned:\nBEFORE: %q\nAFTER:  %q", before, after)
+	}
+}
+
+func TestSetScalarBool_QuotedOldBecomesBareBool(t *testing.T) {
+	in := []byte(`env:
+  FLAG: "true"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	SetScalarBool(env, "FLAG", false)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// We normalize to bare YAML booleans for the edited key
+	if getLineContaining(string(out), "FLAG:") != `  FLAG: false` {
+		t.Fatalf("expected bare YAML boolean; got:\n%s", out)
+	}
+}
+
+func TestDeleteKey_RemovesOnlyThatKey_Surgically(t *testing.T) {
+	in := []byte(`# header
+env:
+  A: "1"
+  B: "2"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	DeleteKey(env, "A")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// header intact
+	if getLineContaining(string(out), "# header") != "# header" {
+		t.Fatalf("header changed")
+	}
+	if strings.Contains(string(out), "A:") {
+		t.Fatalf("A should be deleted; got:\n%s", out)
+	}
+	// B unchanged
+	if getLineContaining(string(out), "B:") != `  B: "2"` {
+		t.Fatalf("B line changed:\n%s", out)
+	}
+}
+
+func TestDeleteKey_RemovesAllDuplicates(t *testing.T) {
+	in := []byte(`env:
+  A: "x"
+  A: "y"
+  B: "z"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	DeleteKey(env, "A")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "A:") {
+		t.Fatalf("expected all A entries removed; got:\n%s", out)
+	}
+	if getLineContaining(string(out), "B:") != `  B: "z"` {
+		t.Fatalf("B should remain; got:\n%s", out)
+	}
+}
+
+func TestDeleteKey_Missing_NoChange(t *testing.T) {
+	in := []byte(`env:
+  X: "1"
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := EnsurePath(doc, "env")
+	DeleteKey(env, "Y") // not present
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(out) != string(in) {
+		t.Fatalf("deleting non-existent key should not change output\nbefore:\n%s\nafter:\n%s", in, out)
+	}
+}
+
+func TestA(t *testing.T) {
+	in := []byte(`deploy:
+  envs:
+    KEEP_THIS: keep_value
+    REMOVE_THIS: remove_value
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	js := EnsurePath(doc, "deploy")
+	envs := EnsurePath(js, "envs")
+	DeleteKey(envs, "REMOVE_THIS")
+	output, err := Marshal(doc)
+
+	print(output, err)
+}
+func TestInsertNewEnvVarUnderNestedMapping(t *testing.T) {
+	in := []byte(`deploy:
+  envs:
+    EXISTING_KEY: existing_value
+  replicas: 3
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// ✅ Call EnsurePath from the document root for the full path.
+	envs := EnsurePath(doc, "deploy", "envs")
+	SetScalarString(envs, "NEW_ENV", "new_value")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(out)
+
+	// Existing lines unchanged.
+	if getLineContaining(s, "EXISTING_KEY:") != "    EXISTING_KEY: existing_value" {
+		t.Fatalf("EXISTING_KEY line changed:\n%s", s)
+	}
+	if getLineContaining(s, "replicas:") != "  replicas: 3" {
+		t.Fatalf("replicas line changed:\n%s", s)
+	}
+
+	// New env var appended with correct indent and quoting.
+	newLine := getLineContaining(s, "NEW_ENV:")
+	if !(newLine == "    NEW_ENV: 'new_value'" || newLine == `    NEW_ENV: "new_value"`) {
+		t.Fatalf("unexpected formatting for inserted env var; got: %q\nfull:\n%s", newLine, s)
+	}
+
+	// Ordering: EXISTING_KEY before NEW_ENV; envs block before replicas.
+	posExisting := lineIndexContaining(s, "EXISTING_KEY:")
+	posNew := lineIndexContaining(s, "NEW_ENV:")
+	posReplicas := lineIndexContaining(s, "replicas:")
+	if !(posExisting >= 0 && posNew > posExisting) {
+		t.Fatalf("NEW_ENV should be appended after EXISTING_KEY; EXISTING_KEY=%d NEW_ENV=%d\n%s", posExisting, posNew, s)
+	}
+	if !(posReplicas > posNew) {
+		t.Fatalf("envs section should appear before replicas; NEW_ENV=%d replicas=%d\n%s", posNew, posReplicas, s)
+	}
+}
+
+func TestEnsurePathFromMapping_AllowsChainedCalls(t *testing.T) {
+	in := []byte(`deploy:
+  envs:
+    EXISTING_KEY: existing_value
+  replicas: 3
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// First from doc → "deploy", then from that mapping → "envs"
+	deploy := EnsurePath(doc, "deploy")
+	envs := EnsurePath(deploy, "envs")
+	if envs == nil || envs.Kind != yaml.MappingNode {
+		t.Fatalf("expected mapping node for deploy.envs")
+	}
+
+	SetScalarString(envs, "NEW_ENV", "new_value")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(out)
+
+	// Existing lines unchanged
+	if getLineContaining(s, "EXISTING_KEY:") != "    EXISTING_KEY: existing_value" {
+		t.Fatalf("EXISTING_KEY line changed:\n%s", s)
+	}
+	if getLineContaining(s, "replicas:") != "  replicas: 3" {
+		t.Fatalf("replicas line changed:\n%s", s)
+	}
+
+	// NEW_ENV present with correct indent & quoting
+	nl := getLineContaining(s, "NEW_ENV:")
+	if !(nl == "    NEW_ENV: 'new_value'" || nl == `    NEW_ENV: "new_value"`) {
+		t.Fatalf("NEW_ENV not inserted as expected; got: %q\nfull:\n%s", nl, s)
+	}
+}
+
 // --- small helpers ---
 
 func getLineContaining(s, substr string) string {
