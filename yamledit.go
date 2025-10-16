@@ -1805,6 +1805,10 @@ func stringReplacementToken(oldTok []byte, newVal string) []byte {
 	if len(oldTok) > 0 && oldTok[0] == '"' {
 		return []byte(`"` + escapeDoubleQuotes(newVal) + `"`)
 	}
+	// If the original token was bare and the value didn't change, keep it as-is.
+	if string(oldTok) == newVal {
+		return append([]byte(nil), oldTok...)
+	}
 	// Bare previously
 	if isSafeBareString(newVal) {
 		return []byte(newVal)

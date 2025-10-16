@@ -1108,6 +1108,40 @@ func TestSetScalarBool_QuotedOldBecomesBareBool(t *testing.T) {
 	}
 }
 
+func TestPlainStringsWithSpacesStayUnquotedOnUnrelatedChange(t *testing.T) {
+	in := []byte(`service:
+  envs:
+    SERVICE_URI_LIST: http://node-1.example.net:8081,http://node-2.example.net:8081,http://node-3.example.net:8081
+    JVM_FLAGS: -Xms2048m -Xmx2048m
+  replicas: 3
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Change an unrelated integer field under the same mapping.
+	svc := EnsurePath(doc, "service")
+	SetScalarInt(svc, "replicas", 4)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Ensure the previously bare strings remain unquoted.
+	if got := getLineContaining(string(out), "SERVICE_URI_LIST:"); got != "    SERVICE_URI_LIST: http://node-1.example.net:8081,http://node-2.example.net:8081,http://node-3.example.net:8081" {
+		t.Fatalf("SERVICE_URI_LIST line changed:\n%s", out)
+	}
+	if got := getLineContaining(string(out), "JVM_FLAGS:"); got != "    JVM_FLAGS: -Xms2048m -Xmx2048m" {
+		t.Fatalf("JVM_FLAGS line changed:\n%s", out)
+	}
+	// And the edited field reflects the new value.
+	if getLineContaining(string(out), "replicas:") != "  replicas: 4" {
+		t.Fatalf("replicas not updated correctly:\n%s", out)
+	}
+}
+
 func TestDeleteKey_RemovesOnlyThatKey_Surgically(t *testing.T) {
 	in := []byte(`# header
 env:
