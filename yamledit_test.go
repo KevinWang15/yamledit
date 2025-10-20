@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
+	"github.com/pmezard/go-difflib/difflib"
 	"gopkg.in/yaml.v3"
 )
 
@@ -153,6 +154,52 @@ resources:
 	}
 }
 
+func TestApplyJSONPatchArrayReplaceMinimalDiff(t *testing.T) {
+	original := `service:
+  envs:
+    FEATURE_FLAG: 'true'
+    SERVICE_URL: "https://example.internal"
+  externalSecretEnvs:
+    - name: Z_SECRET
+      path: secrets/apps/prod
+      property: z-val
+    - name: A_SECRET
+      path: secrets/apps/prod
+      property: a-val
+    - name: M_SECRET
+      path: secrets/apps/prod
+      property: m-val
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	patch := mustDecodePatch(t, `[
+		{"op":"replace","path":"","value":[
+			{"name":"Z_SECRET","path":"secrets/apps/prod","property":"z-val"},
+			{"name":"A_SECRET","path":"secrets/apps/prod","property":"a-val-new"},
+			{"name":"M_SECRET","path":"secrets/apps/prod","property":"m-val"}
+		]}
+	]`)
+
+	if err := ApplyJSONPatchAtPath(doc, patch, []string{"service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPath: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	adds, removes := diffStats(diff)
+	if adds > 1 || removes > 1 {
+		t.Fatalf("expected single-line change, got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+}
+
 // --- helpers for tests ---
 
 // findMapNode walks a mapping node by a sequence of scalar keys and returns the final mapping value node.
@@ -178,6 +225,48 @@ func findMapNode(n *yaml.Node, path ...string) *yaml.Node {
 		cur = found
 	}
 	return cur
+}
+
+func mustDecodePatch(t *testing.T, s string) jsonpatch.Patch {
+	t.Helper()
+	patch, err := jsonpatch.DecodePatch([]byte(s))
+	if err != nil {
+		t.Fatalf("jsonpatch decode error: %v", err)
+	}
+	return patch
+}
+
+func unifiedDiff(before, after string) string {
+	diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+		A:        difflib.SplitLines(before),
+		B:        difflib.SplitLines(after),
+		FromFile: "before",
+		ToFile:   "after",
+		Context:  2,
+	})
+	if err != nil {
+		return err.Error()
+	}
+	return diff
+}
+
+func diffStats(diff string) (adds, removes int) {
+	for _, line := range strings.Split(diff, "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		switch line[0] {
+		case '+':
+			if !strings.HasPrefix(line, "+++") {
+				adds++
+			}
+		case '-':
+			if !strings.HasPrefix(line, "---") {
+				removes++
+			}
+		}
+	}
+	return
 }
 
 func TestPreserves2SpaceIndent(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -41,10 +42,8 @@ type docState struct {
 	valueOccByPathKey map[string][]valueOcc
 
 	// explicit deletions requested (path\0key)
-	toDelete map[string]struct{}
-
-	// Force structured encode on next Marshal (e.g., array edits / complex inserts)
-	forceFallback bool
+	toDelete    map[string]struct{}
+	arraysDirty bool // set only when JSON Patch mutates arrays (seq nodes)
 }
 
 // Information about a mapping block in the original YAML
@@ -201,23 +200,33 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	for k := range st.toDelete {
 		delSet[k] = struct{}{}
 	}
-	forceFallback := st.forceFallback
+	arraysDirty := st.arraysDirty
 	st.mu.RUnlock()
 
-	var out []byte
-	var okPatch bool
-	if forceFallback {
-		goto Fallback
+	// If arrays were edited, structured encode is required (surgery doesn't handle seq edits).
+	if arraysDirty {
+		var buf bytes.Buffer
+		enc := gyaml.NewEncoder(&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments))
+		if err := enc.Encode(ordered); err != nil {
+			_ = enc.Close()
+			return nil, err
+		}
+		_ = enc.Close()
+		// clear the flag now that we've materialized the change
+		if s, ok := lookup(doc); ok {
+			s.mu.Lock()
+			s.arraysDirty = false
+			s.mu.Unlock()
+		}
+		return buf.Bytes(), nil
 	}
-
-	// Attempt byte-surgical patching
-	out, okPatch = marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent, delSet)
+	// Attempt byte-surgical patching first
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent, delSet)
 	if okPatch {
 		return out, nil
 	}
 
 	// Fallback: structured encode (still preserves comments/order/indent)
-Fallback:
 	var buf bytes.Buffer
 	enc := gyaml.NewEncoder(
 		&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments),
@@ -970,6 +979,17 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > mi.lastLineEnd {
 				mi.lastLineEnd = childMi.lastLineEnd
 			}
+		} else if v.Kind == yaml.SequenceNode {
+			// Recurse into sequence items; index mapping items with a synthetic index segment
+			for idx, item := range v.Content {
+				if item.Kind == yaml.MappingNode {
+					childPath := append(append([]string{}, cur...), key, indexSeg(idx))
+					indexPositions(st, item, childPath)
+					if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > mi.lastLineEnd {
+						mi.lastLineEnd = childMi.lastLineEnd
+					}
+				}
+			}
 		}
 	}
 }
@@ -982,6 +1002,9 @@ type patch struct {
 	data  []byte
 	seq   int // stable order for equal start
 }
+
+// index segment for array items; kept distinct from user keys
+func indexSeg(i int) string { return fmt.Sprintf("#%d", i) }
 
 func marshalBySurgery(
 	original []byte,
@@ -1009,7 +1032,8 @@ func marshalBySurgery(
 		_ = ok                             // keep the block to allow early returns neatly
 		mutableMI := cloneMapIndex(mapIdx) // local copy to advance insertion anchors
 
-		// 1) Replace ints/strings that changed (and existed originally)
+		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
+		//    including inside arrays of mappings.
 		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx)
 		if !replaceOK {
 			return nil, false
@@ -1084,6 +1108,14 @@ func marshalBySurgery(
 	// Apply patches
 	var out bytes.Buffer
 	cursor := 0
+	// If no patches but logical doc differs (e.g., array edits we can't express), signal fallback.
+	if len(patches) == 0 {
+		if !logicalEqualOrdered(originalOrdered, current) {
+			return nil, false
+		}
+		// nothing changed logically → return original
+		return original, true
+	}
 	for _, p := range patches {
 		if p.start < cursor || p.end < p.start || p.end > len(original) {
 			return nil, false
@@ -1096,10 +1128,54 @@ func marshalBySurgery(
 	return out.Bytes(), true
 }
 
+// Compare logical structures (ignores scalar formatting). Used to decide fallback when
+// no surgical patches were produced but the doc actually changed (e.g., array edits).
+func logicalEqualOrdered(a, b gyaml.MapSlice) bool {
+	return reflect.DeepEqual(toPlain(a), toPlain(b))
+}
+
+func toPlain(v interface{}) interface{} {
+	switch t := v.(type) {
+	case gyaml.MapSlice:
+		m := map[string]interface{}{}
+		for _, it := range t {
+			k := fmt.Sprint(it.Key)
+			m[k] = toPlain(it.Value)
+		}
+		return m
+	case []interface{}:
+		out := make([]interface{}, 0, len(t))
+		for _, e := range t {
+			out = append(out, toPlain(e))
+		}
+		return out
+	default:
+		return t
+	}
+}
 func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
 	var patches []patch
-	var walk func(ms gyaml.MapSlice, path []string) bool
-	walk = func(ms gyaml.MapSlice, path []string) bool {
+
+	var walkMap func(ms gyaml.MapSlice, path []string) bool
+	var walkArr func(arr []interface{}, path []string) bool
+
+	walkArr = func(arr []interface{}, path []string) bool {
+		for i, el := range arr {
+			seg := indexSeg(i)
+			switch ev := el.(type) {
+			case gyaml.MapSlice:
+				if !walkMap(ev, append(path, seg)) {
+					return false
+				}
+			// Arrays of scalars not supported surgically yet; fall through.
+			default:
+				continue
+			}
+		}
+		return true
+	}
+
+	walkMap = func(ms gyaml.MapSlice, path []string) bool {
 		for _, it := range ms {
 			k, ok := it.Key.(string)
 			if !ok {
@@ -1107,7 +1183,11 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 			}
 			switch v := it.Value.(type) {
 			case gyaml.MapSlice:
-				if !walk(v, append(path, k)) {
+				if !walkMap(v, append(path, k)) {
+					return false
+				}
+			case []interface{}:
+				if !walkArr(v, append(path, k)) {
 					return false
 				}
 			case int:
@@ -1196,7 +1276,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 		}
 		return true
 	}
-	if !walk(current, nil) {
+	if !walkMap(current, nil) {
 		return false, nil
 	}
 	return true, patches
@@ -1450,10 +1530,27 @@ func cloneMapSlice(ms gyaml.MapSlice) gyaml.MapSlice {
 		switch vv := it.Value.(type) {
 		case gyaml.MapSlice:
 			v = cloneMapSlice(vv)
+		case []interface{}:
+			v = cloneSlice(vv)
 		default:
 			v = vv
 		}
 		out = append(out, gyaml.MapItem{Key: it.Key, Value: v})
+	}
+	return out
+}
+
+func cloneSlice(in []interface{}) []interface{} {
+	out := make([]interface{}, len(in))
+	for i, e := range in {
+		switch tv := e.(type) {
+		case gyaml.MapSlice:
+			out[i] = cloneMapSlice(tv)
+		case []interface{}:
+			out[i] = cloneSlice(tv)
+		default:
+			out[i] = tv
+		}
 	}
 	return out
 }
@@ -2316,10 +2413,9 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []stri
 		}
 		if st != nil {
 			st.mu.Lock()
-			st.forceFallback = true
-			// best-effort ordered update
 			absTokens := appendPathTokens(baseFromRoot, tokens)
 			st.ordered, _ = orderedAddArray(st.ordered, absTokens, orderedVal, last.append)
+			st.arraysDirty = true
 			st.mu.Unlock()
 		}
 		return nil
@@ -2364,7 +2460,6 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []stri
 			}
 			path := st.subPathByHN[parent]
 			st.ordered = setAnyAtPath(st.ordered, path, last.key, orderedVal)
-			st.forceFallback = true // arrays/objects require fallback
 			st.mu.Unlock()
 		}
 	}
@@ -2392,9 +2487,9 @@ func opRemove(start *yaml.Node, st *docState, baseFromRoot []string, tokens []pt
 		parent.Content = append(parent.Content[:last.index], parent.Content[last.index+1:]...)
 		if st != nil {
 			st.mu.Lock()
-			st.forceFallback = true
 			absTokens := appendPathTokens(baseFromRoot, tokens)
 			st.ordered, _ = orderedRemoveArray(st.ordered, absTokens)
+			st.arraysDirty = true
 			st.mu.Unlock()
 		}
 		return nil
@@ -2435,9 +2530,9 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 		parent.Content[last.index] = yval
 		if st != nil {
 			st.mu.Lock()
-			st.forceFallback = true
 			absTokens := appendPathTokens(baseFromRoot, tokens)
 			st.ordered, _ = orderedReplaceArray(st.ordered, absTokens, orderedVal)
+			st.arraysDirty = true
 			st.mu.Unlock()
 		}
 		return nil
@@ -2477,7 +2572,6 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			}
 			path := st.subPathByHN[parent]
 			st.ordered = setAnyAtPath(st.ordered, path, last.key, orderedVal)
-			st.forceFallback = true
 			st.mu.Unlock()
 		}
 	}

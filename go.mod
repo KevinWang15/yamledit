@@ -7,3 +7,5 @@ require (
 	github.com/goccy/go-yaml v1.18.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require github.com/pmezard/go-difflib v1.0.0 // indirect
