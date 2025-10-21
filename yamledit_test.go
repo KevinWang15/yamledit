@@ -1871,6 +1871,9 @@ func TestApplyJSONPatchArrayReplaceEntry(t *testing.T) {
 	if !strings.Contains(string(out), "property: target-new") {
 		t.Fatalf("replacement missing:\n%s", string(out))
 	}
+	if !strings.Contains(string(out), "path: data/apps/prod") || strings.Contains(string(out), "path: data/apps/prod-old") {
+		t.Fatalf("path not updated correctly:\n%s", string(out))
+	}
 	if !strings.Contains(string(out), "notes: keep-me") {
 		t.Fatalf("unrelated sections changed:\n%s", string(out))
 	}

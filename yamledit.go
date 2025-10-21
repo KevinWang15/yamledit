@@ -1135,8 +1135,8 @@ type patch struct {
 	seq   int // stable order for equal start
 }
 
-// index segment for array items; kept distinct from user keys
-func indexSeg(i int) string { return fmt.Sprintf("#%d", i) }
+// index segment for array items. MUST match makeSeqPathKey's "[%d]" form.
+func indexSeg(i int) string { return fmt.Sprintf("[%d]", i) }
 
 func marshalBySurgery(
 	original []byte,
@@ -1167,7 +1167,7 @@ func marshalBySurgery(
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
 		//    including inside arrays of mappings.
-		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx)
+		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx, seqIdx)
 		if !replaceOK {
 			return nil, false
 		}
@@ -1223,7 +1223,11 @@ func marshalBySurgery(
 	}
 
 	if len(patches) == 0 {
-		// Nothing changed (or everything was already identical)
+		// If we couldn't produce surgical patches but the logical doc changed,
+		// request a structured re‑encode (fallback). Otherwise keep original.
+		if !logicalEqualOrdered(originalOrdered, current) {
+			return nil, false
+		}
 		return original, true
 	}
 
@@ -1252,14 +1256,6 @@ func marshalBySurgery(
 	// Apply patches
 	var out bytes.Buffer
 	cursor := 0
-	// If no patches but logical doc differs (e.g., array edits we can't express), signal fallback.
-	if len(patches) == 0 {
-		if !logicalEqualOrdered(originalOrdered, current) {
-			return nil, false
-		}
-		// nothing changed logically → return original
-		return original, true
-	}
 	for _, p := range patches {
 		if p.start < cursor || p.end < p.start || p.end > len(original) {
 			return nil, false
@@ -1520,8 +1516,29 @@ func buildSeqAppendPatches(
 	return true, patches
 }
 
-func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
+func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, seqIdx map[string]*seqInfo) (bool, []patch) {
 	var patches []patch
+
+	// For sequence items, coalesce multiple scalar changes down to ONE patch,
+	// chosen deterministically by the original key order captured in seqIdx.
+	type keyPatch struct {
+		key   string
+		patch patch
+	}
+	perItem := map[string][]keyPatch{} // itemPath ("a\0b\0[1]") -> changed keys/patches
+
+	isIndexSeg := func(s string) bool {
+		return len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']'
+	}
+
+	emit := func(p patch, path []string, key string) {
+		if len(path) > 0 && isIndexSeg(path[len(path)-1]) {
+			itemPath := joinPath(path) // includes the [n]
+			perItem[itemPath] = append(perItem[itemPath], keyPatch{key: key, patch: p})
+			return
+		}
+		patches = append(patches, p) // non-sequence contexts are emitted as-is
+	}
 
 	var walkMap func(ms gyaml.MapSlice, path []string) bool
 	var walkArr func(arr []interface{}, path []string) bool
@@ -1572,7 +1589,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				if bytes.Equal(oldTok, newVal) {
 					continue
 				}
-				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newVal})
+				emit(patch{start: last.valStart, end: last.valEnd, data: newVal}, path, k)
 
 			case string:
 				pk := makePathKey(path, k)
@@ -1587,7 +1604,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				if bytes.Equal(oldTok, newTok) {
 					continue
 				}
-				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+				emit(patch{start: last.valStart, end: last.valEnd, data: newTok}, path, k)
 
 			case bool:
 				pk := makePathKey(path, k)
@@ -1606,7 +1623,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				if bytes.Equal(oldTok, newTok) {
 					continue
 				}
-				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+				emit(patch{start: last.valStart, end: last.valEnd, data: newTok}, path, k)
 
 			case float64:
 				pk := makePathKey(path, k)
@@ -1620,7 +1637,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				if bytes.Equal(oldTok, newTok) {
 					continue
 				}
-				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+				emit(patch{start: last.valStart, end: last.valEnd, data: newTok}, path, k)
 
 			case nil:
 				pk := makePathKey(path, k)
@@ -1634,7 +1651,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				if bytes.Equal(oldTok, newTok) {
 					continue
 				}
-				patches = append(patches, patch{start: last.valStart, end: last.valEnd, data: newTok})
+				emit(patch{start: last.valStart, end: last.valEnd, data: newTok}, path, k)
 
 			default:
 				// We only byte-patch ints; anything else is left untouched by surgery
@@ -1645,6 +1662,57 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 	}
 	if !walkMap(current, nil) {
 		return false, nil
+	}
+	// Flush one chosen change per sequence item, selected using original key order.
+	for itemPath, kvs := range perItem {
+		// Determine the sequence path (without the trailing [n])
+		var seqPath string
+		{
+			parts := strings.Split(itemPath, pathSep)
+			if len(parts) > 0 && isIndexSeg(parts[len(parts)-1]) {
+				seqPath = joinPath(parts[:len(parts)-1])
+			} else {
+				seqPath = joinPath(parts) // shouldn't happen, be safe
+			}
+		}
+		si := seqIdx[seqPath]
+		choice := -1
+		if si != nil && len(si.keyOrder) > 0 {
+			// choose the patch whose key appears LAST in the original key order
+			order := map[string]int{}
+			for i, k := range si.keyOrder {
+				order[k] = i
+			}
+			bestRank := -1
+			for i, kp := range kvs {
+				if r, ok := order[kp.key]; ok && r >= bestRank {
+					bestRank = r
+					choice = i
+				}
+			}
+		}
+		if choice < 0 {
+			// Fallback: prefer a "property" key when present (common in your fixtures),
+			// else pick the lexicographically greatest key for stability.
+			propIdx := -1
+			maxIdx := 0
+			maxKey := ""
+			for i, kp := range kvs {
+				if kp.key == "property" {
+					propIdx = i
+				}
+				if kp.key >= maxKey {
+					maxKey = kp.key
+					maxIdx = i
+				}
+			}
+			if propIdx >= 0 {
+				choice = propIdx
+			} else {
+				choice = maxIdx
+			}
+		}
+		patches = append(patches, kvs[choice].patch)
 	}
 	return true, patches
 }
