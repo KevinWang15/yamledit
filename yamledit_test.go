@@ -1985,6 +1985,48 @@ func TestArrayDeleteEntry_ByIndex_FallbackNoChurn(t *testing.T) {
 	}
 }
 
+func TestInlineCommentWhitespacePreservedOnUnrelatedChange(t *testing.T) {
+	in := []byte(`java-service:
+  someField: 'value'  # this comment has 2 spaces before it
+  anotherField: 'test'
+  externalSecretEnvs:
+    - name: EXISTING_VAR
+      path: secret/path
+      property: EXISTING_PROPERTY
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Make a change to externalSecretEnvs (unrelated to someField)
+	patch := mustDecodePatch(t, `[
+		{"op":"add","path":"/-","value":{"name":"A","path":"ab","property":"a"}},
+		{"op":"add","path":"/-","value":{"name":"B","path":"c","property":"c"}}
+	]`)
+
+	if err := ApplyJSONPatchAtPath(doc, patch, []string{"java-service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPath: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Verify the unrelated field's inline comment whitespace is preserved exactly
+	before := getLineContaining(string(in), "someField:")
+	after := getLineContaining(string(out), "someField:")
+	if before != after {
+		t.Fatalf("inline comment whitespace changed on unrelated field:\nBEFORE: %q\nAFTER:  %q\nfull output:\n%s", before, after, string(out))
+	}
+
+	// Also verify the comment still has 2 spaces (more explicit check)
+	if after != "  someField: 'value'  # this comment has 2 spaces before it" {
+		t.Fatalf("expected exact preservation of 2-space inline comment, got: %q\nfull output:\n%s", after, string(out))
+	}
+}
+
 func TestMapDeleteEntry_Surgical(t *testing.T) {
 	original := `service:
   config:
@@ -2023,4 +2065,162 @@ func TestMapDeleteEntry_Surgical(t *testing.T) {
 	if adds != 0 || removes != 1 {
 		t.Fatalf("expected a single-line surgical removal, got %d additions / %d removals:\n%s", adds, removes, diff)
 	}
+}
+
+// TestArrayReplaceWithMultipleOps reproduces production issue: values get scrambled
+// when we replace one entry, remove another, and add a new one
+func TestArrayReplaceWithMultipleOps(t *testing.T) {
+	original := `java-service:
+  envs:
+    ENABLE_CORE_TRANSACTION_CONSUMER: 'true'
+    KAFKA_BROKERS: example.com:1234
+  externalSecretEnvs:
+    - name: POSTGRES_10_PASSWD
+      path: test/app/prod/hk
+      property: POSTGRES_10_PASSWD
+    - name: POSTGRES_RO_PASSWORD
+      path: test/app/prod/hk
+      property: POSTGRES_RO_PASSWORD
+    - name: LAUNCHDARKLY_KEY
+      path: data/launchdarkly/prod
+      property: CONTAINER
+    - name: SECRET_TEMPORAL_CERT
+      path: data/common
+      property: TEMPORAL_CERT
+    - name: KAFKA_CORE_BANKING_USER_PASSWORD
+      path: data/kafka/user/prod
+      property: core-banking_pwd
+    - name: KAFKA_CORE_BANKING_USERNAME
+      path: data/kafka/user/prod
+      property: core-banking_user
+    - name: TRUST_STORE_PASSWORD
+      path: data/kafka/ssl/prod
+      property: TRUSTSTORE_PASSWORD
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Simulate the operations from the production request:
+	// 1. Replace KAFKA_CORE_BANKING_USERNAME
+	// 2. Remove LAUNCHDARKLY_KEY
+	// 3. Add A
+	records := map[string]map[string]any{
+		"POSTGRES_10_PASSWD":               {"path": "test/app/prod/hk", "property": "POSTGRES_10_PASSWD"},
+		"POSTGRES_RO_PASSWORD":             {"path": "test/app/prod/hk", "property": "POSTGRES_RO_PASSWORD"},
+		"SECRET_TEMPORAL_CERT":             {"path": "data/common", "property": "TEMPORAL_CERT"},
+		"KAFKA_CORE_BANKING_USER_PASSWORD": {"path": "data/kafka/user/prod", "property": "core-banking_pwd"},
+		"KAFKA_CORE_BANKING_USERNAME":      {"path": "data/kafka/user/pro", "property": "core-banking_use"}, // REPLACED
+		"TRUST_STORE_PASSWORD":             {"path": "data/kafka/ssl/prod", "property": "TRUSTSTORE_PASSWORD"},
+		"A":                                {"path": "A", "property": "A"}, // ADDED
+		// LAUNCHDARKLY_KEY is REMOVED (not in map)
+	}
+
+	order := extractArrayOrder(doc, []string{"java-service", "externalSecretEnvs"}, "name")
+	t.Logf("Original order: %v", order)
+
+	arrayJSON, err := buildArrayJSON(records, order, "name", []string{"path", "property"})
+	if err != nil {
+		t.Fatalf("buildArrayJSON: %v", err)
+	}
+	t.Logf("Built JSON: %s", string(arrayJSON))
+
+	if err := applySequencePatch(doc, []string{"java-service", "externalSecretEnvs"}, "replace", arrayJSON); err != nil {
+		t.Fatalf("applySequencePatch: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	t.Logf("Diff:\n%s", diff)
+	t.Logf("\n=== OUTPUT ===\n%s\n=== END ===", string(out))
+
+	// Parse the output to verify correctness
+	var result struct {
+		JavaService struct {
+			ExternalSecretEnvs []map[string]string `yaml:"externalSecretEnvs"`
+		} `yaml:"java-service"`
+	}
+	if err := yaml.Unmarshal(out, &result); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// Build a map for easier verification
+	resultMap := make(map[string]map[string]string)
+	for _, item := range result.JavaService.ExternalSecretEnvs {
+		name := item["name"]
+		resultMap[name] = item
+	}
+
+	t.Logf("Result map: %v", resultMap)
+
+	// Verify KAFKA_CORE_BANKING_USERNAME was updated correctly
+	if entry, ok := resultMap["KAFKA_CORE_BANKING_USERNAME"]; ok {
+		if entry["path"] != "data/kafka/user/pro" {
+			t.Errorf("KAFKA_CORE_BANKING_USERNAME path: expected 'data/kafka/user/pro', got '%s'", entry["path"])
+		}
+		if entry["property"] != "core-banking_use" {
+			t.Errorf("KAFKA_CORE_BANKING_USERNAME property: expected 'core-banking_use', got '%s'", entry["property"])
+		}
+	} else {
+		t.Errorf("KAFKA_CORE_BANKING_USERNAME not found in result")
+	}
+
+	// Verify LAUNCHDARKLY_KEY was removed
+	if _, exists := resultMap["LAUNCHDARKLY_KEY"]; exists {
+		t.Errorf("LAUNCHDARKLY_KEY should have been removed, but still exists: %v", resultMap["LAUNCHDARKLY_KEY"])
+	}
+
+	// Verify A was added
+	if entry, ok := resultMap["A"]; ok {
+		if entry["path"] != "A" {
+			t.Errorf("A path: expected 'A', got '%s'", entry["path"])
+		}
+		if entry["property"] != "A" {
+			t.Errorf("A property: expected 'A', got '%s'", entry["property"])
+		}
+	} else {
+		t.Errorf("A not found in result")
+	}
+
+	// Verify other entries are unchanged
+	expectedUnchanged := map[string]map[string]string{
+		"POSTGRES_10_PASSWD":               {"path": "test/app/prod/hk", "property": "POSTGRES_10_PASSWD"},
+		"POSTGRES_RO_PASSWORD":             {"path": "test/app/prod/hk", "property": "POSTGRES_RO_PASSWORD"},
+		"SECRET_TEMPORAL_CERT":             {"path": "data/common", "property": "TEMPORAL_CERT"},
+		"KAFKA_CORE_BANKING_USER_PASSWORD": {"path": "data/kafka/user/prod", "property": "core-banking_pwd"},
+		"TRUST_STORE_PASSWORD":             {"path": "data/kafka/ssl/prod", "property": "TRUSTSTORE_PASSWORD"},
+	}
+
+	for name, expected := range expectedUnchanged {
+		if entry, ok := resultMap[name]; ok {
+			if entry["path"] != expected["path"] {
+				t.Errorf("%s path: expected '%s', got '%s'", name, expected["path"], entry["path"])
+			}
+			if entry["property"] != expected["property"] {
+				t.Errorf("%s property: expected '%s', got '%s'", name, expected["property"], entry["property"])
+			}
+		} else {
+			t.Errorf("%s not found in result", name)
+		}
+	}
+
+	// Verify total count
+	expectedCount := 7 // 7 original - 1 removed (LAUNCHDARKLY) + 1 added (A)
+	if len(resultMap) != expectedCount {
+		t.Errorf("Expected %d entries, got %d. Entries: %v", expectedCount, len(resultMap), getMapKeys(resultMap))
+	}
+}
+
+func getMapKeys(m map[string]map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
