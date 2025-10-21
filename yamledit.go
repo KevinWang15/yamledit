@@ -3055,6 +3055,17 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			st.mu.Unlock()
 		}
 	}
+	// Ensure the ordered view also reflects scalar updates inside sequence items.
+	// This handles cases where 'parent' is a mapping within an array and therefore
+	// lacks a handle → path entry in subPathByHN.
+	if st != nil {
+		st.mu.Lock()
+		absTokens := appendPathTokens(baseFromRoot, tokens)
+		if nv, err := orderedSetAtPathTokens(st.ordered, absTokens, orderedVal); err == nil {
+			st.ordered = nv
+		}
+		st.mu.Unlock()
+	}
 	return nil
 }
 
@@ -3259,6 +3270,99 @@ func orderedArrayEdit(ms gyaml.MapSlice, path []ptrToken, edit func([]interface{
 			return v, nil
 		default:
 			return nil, fmt.Errorf("unexpected type at segment %d", depth)
+		}
+	}
+	out, err := recur(ms, 0)
+	if err != nil {
+		return ms, err
+	}
+	res, _ := out.(gyaml.MapSlice)
+	return res, nil
+}
+
+// orderedSetAtPathTokens sets a scalar value at the path indicated by tokens.
+// The final token MUST be a mapping key (not an index). Intermediate segments
+// may traverse through arrays (sequence indices) and mappings.
+func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{}) (gyaml.MapSlice, error) {
+	ov := jsonValueToOrdered(val)
+
+	var recur func(cur interface{}, depth int) (interface{}, error)
+	recur = func(cur interface{}, depth int) (interface{}, error) {
+		if depth >= len(path) {
+			return nil, fmt.Errorf("orderedSetAtPath: empty path at depth %d", depth)
+		}
+		t := path[depth]
+		switch v := cur.(type) {
+		case gyaml.MapSlice:
+			if t.isIdx {
+				return nil, fmt.Errorf("orderedSetAtPath: expected key at segment %d", depth)
+			}
+			// locate key
+			found := -1
+			for i := range v {
+				if keyEquals(v[i].Key, t.key) {
+					found = i
+					break
+				}
+			}
+			if found < 0 {
+				return nil, fmt.Errorf("orderedSetAtPath: path key %q not found", t.key)
+			}
+			if depth == len(path)-1 {
+				// final segment is a key → set its scalar value
+				v[found].Value = ov
+				return v, nil
+			}
+			next, err := recur(v[found].Value, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[found].Value = next
+			return v, nil
+
+		case map[string]interface{}:
+			// Handle native map as well (can occur inside []interface{}).
+			if t.isIdx {
+				return nil, fmt.Errorf("orderedSetAtPath: expected key at segment %d", depth)
+			}
+			child, ok := v[t.key]
+			if !ok {
+				return nil, fmt.Errorf("orderedSetAtPath: path key %q not found", t.key)
+			}
+			if depth == len(path)-1 {
+				v[t.key] = ov
+				return v, nil
+			}
+			next, err := recur(child, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[t.key] = next
+			return v, nil
+
+		case []interface{}:
+			if !t.isIdx {
+				return nil, fmt.Errorf("orderedSetAtPath: expected index at segment %d", depth)
+			}
+			if t.append {
+				return nil, fmt.Errorf("orderedSetAtPath: '-' not valid for set")
+			}
+			if t.index < 0 || t.index >= len(v) {
+				return nil, fmt.Errorf("orderedSetAtPath: index %d out of bounds", t.index)
+			}
+			if depth == len(path)-1 {
+				// Not used for this test, but support setting entire element if addressed directly.
+				v[t.index] = ov
+				return v, nil
+			}
+			next, err := recur(v[t.index], depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[t.index] = next
+			return v, nil
+		default:
+			return nil, fmt.Errorf("orderedSetAtPath: unexpected type at segment %d (%T)", depth, v)
 		}
 	}
 	out, err := recur(ms, 0)
