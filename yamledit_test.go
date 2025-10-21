@@ -1985,6 +1985,48 @@ func TestArrayDeleteEntry_ByIndex_FallbackNoChurn(t *testing.T) {
 	}
 }
 
+func TestInlineCommentWhitespacePreservedOnUnrelatedChange(t *testing.T) {
+	in := []byte(`java-service:
+  someField: 'value'  # this comment has 2 spaces before it
+  anotherField: 'test'
+  externalSecretEnvs:
+    - name: EXISTING_VAR
+      path: secret/path
+      property: EXISTING_PROPERTY
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Make a change to externalSecretEnvs (unrelated to someField)
+	patch := mustDecodePatch(t, `[
+		{"op":"add","path":"/-","value":{"name":"A","path":"ab","property":"a"}},
+		{"op":"add","path":"/-","value":{"name":"B","path":"c","property":"c"}}
+	]`)
+
+	if err := ApplyJSONPatchAtPath(doc, patch, []string{"java-service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPath: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Verify the unrelated field's inline comment whitespace is preserved exactly
+	before := getLineContaining(string(in), "someField:")
+	after := getLineContaining(string(out), "someField:")
+	if before != after {
+		t.Fatalf("inline comment whitespace changed on unrelated field:\nBEFORE: %q\nAFTER:  %q\nfull output:\n%s", before, after, string(out))
+	}
+
+	// Also verify the comment still has 2 spaces (more explicit check)
+	if after != "  someField: 'value'  # this comment has 2 spaces before it" {
+		t.Fatalf("expected exact preservation of 2-space inline comment, got: %q\nfull output:\n%s", after, string(out))
+	}
+}
+
 func TestMapDeleteEntry_Surgical(t *testing.T) {
 	original := `service:
   config:
