@@ -249,6 +249,21 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 					lineEnd:      lineEnd,
 				})
 			}
+		} else if it.Kind == yaml.ScalarNode {
+			// Scalar item in a sequence, e.g. "- 8080  # comment"
+			valStart := offsetFor(st.lineOffsets, it.Line, it.Column)
+			if valStart >= 0 && valStart < len(st.original) {
+				valEnd := findScalarEndOnLine(st.original, valStart)
+				lineStart := lineStartOffset(st.lineOffsets, it.Line)
+				lineEnd := findLineEnd(st.original, valStart)
+				pk := makeSeqPathKey(cur, idx, scalarItemKey)
+				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+					keyLineStart: lineStart,
+					valStart:     valStart,
+					valEnd:       valEnd,
+					lineEnd:      lineEnd,
+				})
+			}
 		}
 	}
 }
@@ -273,6 +288,13 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 		si.firstItemStart = lineStartOffset(st.lineOffsets, fk.Line)
 	} else {
 		si.firstItemStart = lineStartOffset(st.lineOffsets, first.Line)
+	}
+	// Detect base indent from the first item's line even for scalar sequences.
+	{
+		ls := lineStartOffset(st.lineOffsets, first.Line)
+		le := findLineEnd(st.original, ls)
+		ln := st.original[ls:le]
+		si.indent = leadingSpaces(ln)
 	}
 	// Per‑item boundaries and names
 	si.items = si.items[:0]
@@ -1563,15 +1585,25 @@ func buildSeqAppendPatches(
 					sb.WriteString("\n")
 				}
 				for i := olen; i < nlen; i++ {
-					msItem, ok := toMapSlice(v[i])
-					if !ok {
-						return false
+					switch el := v[i].(type) {
+					case gyaml.MapSlice, map[string]interface{}:
+						// existing mapping rendering path
+						msItem, ok := toMapSlice(v[i])
+						if !ok {
+							return false
+						}
+						txt, ok := renderItem(si, msItem)
+						if !ok {
+							return false
+						}
+						sb.WriteString(txt)
+					default:
+						// scalar append: "- <scalar>\n" honoring original indent
+						sb.WriteString(strings.Repeat(" ", si.indent))
+						sb.WriteString("- ")
+						sb.WriteString(renderScalar(el))
+						sb.WriteString("\n")
 					}
-					txt, ok := renderItem(si, msItem)
-					if !ok {
-						return false
-					}
-					sb.WriteString(txt)
 					// advance anchor for chaining multiple appends in same sequence
 					si.lastItemEnd = insertPos + len(sb.String()) - 1
 				}
@@ -1630,7 +1662,54 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				}
 			// Arrays of scalars not supported surgically yet; fall through.
 			default:
-				continue
+				// Handle arrays of scalars surgically: replace only the scalar token on its line.
+				// Skip if this entire sequence was already marked as fully replaced.
+				seqPath := joinPath(path)
+				if _, skip := skipSeq[seqPath]; skip {
+					continue
+				}
+				pk := makeSeqPathKey(path, i, scalarItemKey)
+				occs := valIdx[pk]
+				if len(occs) == 0 {
+					// No original anchor for this index → probably an appended item.
+					// Appends are handled by buildSeqAppendPatches.
+					continue
+				}
+				last := occs[len(occs)-1]
+
+				makeTok := func(oldTok []byte, v interface{}) []byte {
+					switch t := v.(type) {
+					case int:
+						return []byte(fmt.Sprintf("%d", t))
+					case float64:
+						return []byte(strconv.FormatFloat(t, 'g', -1, 64))
+					case bool:
+						if t {
+							return []byte("true")
+						}
+						return []byte("false")
+					case string:
+						return stringReplacementToken(oldTok, t)
+					case nil:
+						return []byte("null")
+					default:
+						// best-effort string
+						return stringReplacementToken(oldTok, fmt.Sprint(t))
+					}
+				}
+
+				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
+				newTok := makeTok(oldTok, ev)
+
+				// Avoid churn if identical bytes
+				if bytes.Equal(oldTok, newTok) {
+					continue
+				}
+				patches = append(patches, patch{
+					start: last.valStart,
+					end:   last.valEnd,
+					data:  newTok,
+				})
 			}
 		}
 		return true
@@ -1865,6 +1944,19 @@ func buildSeqReplaceBlockPatches(
 	var patches []patch
 	replaced := map[string]struct{}{}
 
+	// Helper: is every element in arr a scalar (non-map, non-array)?
+	isArrayOfScalars := func(arr []interface{}) bool {
+		for _, el := range arr {
+			switch el.(type) {
+			case gyaml.MapSlice, map[string]interface{}, []interface{}:
+				return false
+			default:
+				// ints, float64, bool, string, nil → scalar
+			}
+		}
+		return true
+	}
+
 	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
 	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
 		cur := ms
@@ -2093,6 +2185,11 @@ func buildSeqReplaceBlockPatches(
 				mpath := joinPath(append(path, k))
 				si := seqIdx[mpath]
 				if si == nil || !si.originalPath || !si.hasAnyItem || si.firstItemStart <= 0 || si.lastItemEnd <= 0 {
+					continue
+				}
+				if isArrayOfScalars(origArr) && isArrayOfScalars(v) {
+					// Let later passes (scalar replacements + appends) handle this surgically.
+					// Do NOT mark as replaced and do NOT return failure.
 					continue
 				}
 				if !shapeChanged(origArr, v) {
@@ -2413,7 +2510,10 @@ func cloneValueIndex(in map[string][]valueOcc) map[string][]valueOcc {
 	return out
 }
 
-const pathSep = "\x00"
+const pathSep = "\x00p\x00"
+
+// Sentinel key used to index scalar values that are direct items of a sequence ("- <scalar>")
+const scalarItemKey = "\x00s\x00"
 
 func joinPath(path []string) string {
 	if len(path) == 0 {

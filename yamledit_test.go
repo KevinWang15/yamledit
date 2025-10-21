@@ -2253,7 +2253,7 @@ java-service:
 	records := map[string]map[string]any{
 		"BAR": {"path": "bar/path", "property": "BAR_PROP"},
 		"FOO": {"path": "foo/updated", "property": "FOO_PROP"}, // REPLACED
-		"NEW": {"path": "new/path", "property": "NEW_PROP"},   // ADDED
+		"NEW": {"path": "new/path", "property": "NEW_PROP"},    // ADDED
 	}
 
 	order := extractArrayOrder(doc, []string{"java-service", "externalSecretEnvs"}, "name")
@@ -2303,5 +2303,115 @@ java-service:
 	// Verify new record was added
 	if !strings.Contains(updatedStr, "name: NEW") {
 		t.Errorf("new record not present:\n%s", updatedStr)
+	}
+}
+
+// TestArrayOfScalars_EditPreserveCommentsMinimalDiff
+// Expects surgical behavior & comment preservation on a sequence of scalars.
+// This test is expected to FAIL with the current implementation because arrays
+// of scalars fall back to a structured re-encode, which drops inter-item comments
+// and causes multi-line diffs.
+func TestArrayOfScalars_EditPreserveCommentsMinimalDiff(t *testing.T) {
+	original := `service:
+  ports:
+    - 8080  # public
+    - 9090  # admin
+    - 10000
+  note: "keep me"
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Replace the whole array value at basePath "service/ports":
+	//  - change 9090 -> 9091
+	//  - keep 8080 and 10000
+	//  - append 11000
+	base := []string{"service", "ports"}
+	patch := []byte(`[
+		{"op":"replace","path":"","value":[8080,9091,10000,11000]}
+	]`)
+	if err := ApplyJSONPatchAtPathBytes(doc, patch, base); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(out)
+
+	// Expectation (DESIGNED TO FAIL CURRENTLY):
+	// 1) Inter-item comments should be preserved
+	if !strings.Contains(s, "# public") || !strings.Contains(s, "# admin") {
+		t.Fatalf("expected inter-item comments to be preserved; got:\n%s", s)
+	}
+	// 2) Minimal churn: a couple of lines max (one changed for 9091 + one added for 11000)
+	diff := unifiedDiff(original, s)
+	adds, removes := diffStats(diff)
+	if adds > 2 || removes > 1 {
+		t.Fatalf("expected minimal diff for scalar array update; got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+	// 3) Unrelated fields untouched
+	if getLineContaining(s, `note:`) != `  note: "keep me"` {
+		t.Fatalf("unrelated field churned:\n%s", s)
+	}
+}
+
+func TestScalarToMapping_FallbackMinimalChurn(t *testing.T) {
+	original := `cfg:
+  timeout: 30  # seconds
+  name: app
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cfg := EnsurePath(doc, "cfg")
+	timeoutMap := EnsurePath(cfg, "timeout") // scalar -> mapping (shape change)
+	SetScalarInt(timeoutMap, "hard", 60)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(out)
+
+	// 1) Semantics: timeout is now a mapping with hard: 60
+	var round struct {
+		Cfg struct {
+			Timeout struct {
+				Hard int `yaml:"hard"`
+			} `yaml:"timeout"`
+			Name string `yaml:"name"`
+		} `yaml:"cfg"`
+	}
+	if err := yaml.Unmarshal(out, &round); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, s)
+	}
+	if round.Cfg.Timeout.Hard != 60 {
+		t.Fatalf("timeout.hard = %d, want 60\n%s", round.Cfg.Timeout.Hard, s)
+	}
+
+	// 2) Comment preserved on the timeout key line
+	timeoutLine := getLineContaining(s, "timeout:")
+	if !strings.Contains(timeoutLine, "# seconds") {
+		t.Fatalf("inline comment lost on timeout line:\n%s", s)
+	}
+
+	// 3) Unrelated line unchanged byte-for-byte
+	if getLineContaining(s, "name:") != "  name: app" {
+		t.Fatalf("unrelated line churned:\n%s", s)
+	}
+
+	// (Optional) 4) Diff is localized (don’t require single-line)
+	diff := unifiedDiff(original, s)
+	adds, removes := diffStats(diff)
+	if adds < 1 || removes < 1 {
+		t.Fatalf("expected at least one add and one removal due to shape change; got +%d/-%d\n%s", adds, removes, diff)
 	}
 }
