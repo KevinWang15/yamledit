@@ -3,6 +3,7 @@ package yamledit
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 
@@ -267,6 +268,165 @@ func diffStats(diff string) (adds, removes int) {
 		}
 	}
 	return
+}
+
+func cloneRecords(in map[string]map[string]any) map[string]map[string]any {
+	out := make(map[string]map[string]any, len(in))
+	for k, v := range in {
+		c := make(map[string]any, len(v))
+		for fk, fv := range v {
+			c[fk] = fv
+		}
+		out[k] = c
+	}
+	return out
+}
+
+func extractArrayOrder(doc *yaml.Node, path []string, keyField string) []string {
+	if len(path) == 0 || doc == nil {
+		return nil
+	}
+	cur := doc
+	if cur.Kind == yaml.DocumentNode && len(cur.Content) > 0 {
+		cur = cur.Content[0]
+	}
+	for _, segment := range path[:len(path)-1] {
+		if cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		var next *yaml.Node
+		for i := 0; i+1 < len(cur.Content); i += 2 {
+			if cur.Content[i].Kind == yaml.ScalarNode && cur.Content[i].Value == segment {
+				next = cur.Content[i+1]
+				break
+			}
+		}
+		if next == nil {
+			return nil
+		}
+		cur = next
+	}
+	final := path[len(path)-1]
+	if cur.Kind != yaml.MappingNode {
+		return nil
+	}
+	var seq *yaml.Node
+	for i := 0; i+1 < len(cur.Content); i += 2 {
+		if cur.Content[i].Kind == yaml.ScalarNode && cur.Content[i].Value == final {
+			seq = cur.Content[i+1]
+			break
+		}
+	}
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return nil
+	}
+	order := make([]string, 0, len(seq.Content))
+	for _, item := range seq.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		for i := 0; i+1 < len(item.Content); i += 2 {
+			if item.Content[i].Kind == yaml.ScalarNode && item.Content[i].Value == keyField {
+				if item.Content[i+1].Kind == yaml.ScalarNode {
+					order = append(order, item.Content[i+1].Value)
+				}
+				break
+			}
+		}
+	}
+	return order
+}
+
+func buildArrayJSON(records map[string]map[string]any, existingOrder []string, keyField string, fields []string) ([]byte, error) {
+	seen := make(map[string]bool, len(existingOrder))
+	keys := make([]string, 0, len(records))
+	for _, k := range existingOrder {
+		if _, ok := records[k]; ok && !seen[k] {
+			keys = append(keys, k)
+			seen[k] = true
+		}
+	}
+	var extras []string
+	for k := range records {
+		if !seen[k] {
+			extras = append(extras, k)
+		}
+	}
+	sort.Strings(extras)
+	keys = append(keys, extras...)
+
+	buf := bytes.NewBufferString("[")
+	for i, key := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteByte('{')
+		first := true
+		if err := writeJSONField(buf, keyField, key, &first); err != nil {
+			return nil, err
+		}
+		for _, f := range fields {
+			if val, ok := records[key][f]; ok {
+				if err := writeJSONField(buf, f, val, &first); err != nil {
+					return nil, err
+				}
+			}
+		}
+		for fk, fv := range records[key] {
+			if fk == keyField {
+				continue
+			}
+			found := false
+			for _, f := range fields {
+				if f == fk {
+					found = true
+					break
+				}
+			}
+			if !found {
+				if err := writeJSONField(buf, fk, fv, &first); err != nil {
+					return nil, err
+				}
+			}
+		}
+		buf.WriteByte('}')
+	}
+	buf.WriteByte(']')
+	return buf.Bytes(), nil
+}
+
+func writeJSONField(buf *bytes.Buffer, name string, value any, first *bool) error {
+	if !*first {
+		buf.WriteByte(',')
+	}
+	*first = false
+
+	nameJSON, err := json.Marshal(name)
+	if err != nil {
+		return err
+	}
+	buf.Write(nameJSON)
+	buf.WriteByte(':')
+
+	valJSON, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	buf.Write(valJSON)
+	return nil
+}
+
+func applySequencePatch(doc *yaml.Node, path []string, op string, value []byte) error {
+	type patchOp struct {
+		Op    string          `json:"op"`
+		Path  string          `json:"path"`
+		Value json.RawMessage `json:"value,omitempty"`
+	}
+	payload, err := json.Marshal([]patchOp{{Op: op, Path: "", Value: json.RawMessage(value)}})
+	if err != nil {
+		return err
+	}
+	return ApplyJSONPatchAtPathBytes(doc, payload, path)
 }
 
 func TestPreserves2SpaceIndent(t *testing.T) {
@@ -1659,5 +1819,59 @@ func TestApplyJSONPatchArrayAddMinimalDiff(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "SERVICE_URL: \"https://example.internal/\"") {
 		t.Fatalf("env block modified:\n%s", string(out))
+	}
+}
+
+func TestApplyJSONPatchArrayReplaceEntry(t *testing.T) {
+	original := `service:
+  envs:
+    FEATURE_FLAG: "true"
+  externalSecretEnvs:
+    - name: TARGET
+      path: data/apps/prod-old
+      property: target-old
+    - name: OTHER
+      path: data/apps/prod
+      property: other
+  notes: keep-me
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	records := map[string]map[string]any{
+		"TARGET": {"path": "data/apps/prod-old", "property": "target-old"},
+		"OTHER":  {"path": "data/apps/prod", "property": "other"},
+	}
+
+	next := cloneRecords(records)
+	next["TARGET"] = map[string]any{"path": "data/apps/prod", "property": "target-new"}
+
+	order := extractArrayOrder(doc, []string{"service", "externalSecretEnvs"}, "name")
+	arrayJSON, err := buildArrayJSON(next, order, "name", []string{"path", "property"})
+	if err != nil {
+		t.Fatalf("buildArrayJSON: %v", err)
+	}
+	if err := applySequencePatch(doc, []string{"service", "externalSecretEnvs"}, "replace", arrayJSON); err != nil {
+		t.Fatalf("applySequencePatch: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	adds, removes := diffStats(diff)
+	if adds > 1 || removes > 1 {
+		t.Fatalf("expected targeted change, got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+	if !strings.Contains(string(out), "property: target-new") {
+		t.Fatalf("replacement missing:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "notes: keep-me") {
+		t.Fatalf("unrelated sections changed:\n%s", string(out))
 	}
 }
