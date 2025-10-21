@@ -1878,3 +1878,149 @@ func TestApplyJSONPatchArrayReplaceEntry(t *testing.T) {
 		t.Fatalf("unrelated sections changed:\n%s", string(out))
 	}
 }
+
+func TestArrayItemAttributeEdit_ByIndex(t *testing.T) {
+	original := `service:
+  envs:
+    FEATURE_FLAG: "true"
+  externalSecretEnvs:
+    - name: TARGET
+      path: data/apps/prod-old
+      property: target-old
+    - name: OTHER
+      path: data/apps/prod
+      property: other
+  notes: keep-me
+`
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Replace ONLY the 'property' field of item at index 0 (TARGET)
+	base := []string{"service", "externalSecretEnvs"}
+	patch := []byte(`[{"op":"replace","path":"/0/property","value":"target-new"}]`)
+	if err := ApplyJSONPatchAtPathBytes(doc, patch, base); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	adds, removes := diffStats(diff)
+
+	// Single-line, targeted change expected
+	if adds > 1 || removes > 1 {
+		t.Fatalf("expected single-line change, got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+	if !strings.Contains(string(out), "property: target-new") {
+		t.Fatalf("property not updated:\n%s", string(out))
+	}
+	// Make sure unrelated fields & quoting are untouched
+	if getLineContaining(string(out), "FEATURE_FLAG:") != `    FEATURE_FLAG: "true"` {
+		t.Fatalf("unrelated env changed:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "path: data/apps/prod-old") {
+		t.Fatalf("path should remain old in this test:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "notes: keep-me") {
+		t.Fatalf("unrelated section changed:\n%s", string(out))
+	}
+}
+
+func TestArrayDeleteEntry_ByIndex_FallbackNoChurn(t *testing.T) {
+	original := `service:
+  envs:
+    FEATURE_FLAG: "true"
+  externalSecretEnvs:
+    - name: TARGET
+      path: data/apps/prod
+      property: target
+    - name: OTHER
+      path: data/apps/prod
+      property: other
+  notes: keep-me
+`
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Remove the first array item (index 0). This triggers array fallback encode.
+	base := []string{"service", "externalSecretEnvs"}
+	patch := []byte(`[{"op":"remove","path":"/0"}]`)
+	if err := ApplyJSONPatchAtPathBytes(doc, patch, base); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	s := string(out)
+	// TARGET entry should be gone; OTHER should remain
+	if strings.Contains(s, "name: TARGET") {
+		t.Fatalf("TARGET should be removed:\n%s", s)
+	}
+	if !strings.Contains(s, "name: OTHER") {
+		t.Fatalf("OTHER should remain:\n%s", s)
+	}
+	// Unrelated sections should remain byte-stable (esp. envs + notes)
+	if getLineContaining(s, "FEATURE_FLAG:") != `    FEATURE_FLAG: "true"` {
+		t.Fatalf("envs block churned:\n%s", s)
+	}
+	if !strings.Contains(s, "notes: keep-me") {
+		t.Fatalf("notes section changed:\n%s", s)
+	}
+
+	diff := unifiedDiff(original, s)
+	adds, removes := diffStats(diff)
+	// Removing one 3-line item usually yields 0 additions and >=3 removals.
+	if adds != 0 || removes < 3 {
+		t.Fatalf("expected only removals for array deletion; got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+}
+
+func TestMapDeleteEntry_Surgical(t *testing.T) {
+	original := `service:
+  config:
+    timeout: 30  # seconds
+    retries: 3 # attempts
+  port: 8080
+`
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Delete a nested map key surgically.
+	cfg := EnsurePath(doc, "service", "config")
+	DeleteKey(cfg, "timeout")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	s := string(out)
+	// timeout line should be gone, retries & port untouched
+	if strings.Contains(s, "timeout:") {
+		t.Fatalf("'timeout' should be removed:\n%s", s)
+	}
+	if getLineContaining(s, "retries:") != "    retries: 3 # attempts" {
+		t.Fatalf("retries changed:\n%s", s)
+	}
+	if getLineContaining(s, "port:") != "  port: 8080" {
+		t.Fatalf("port changed:\n%s", s)
+	}
+
+	diff := unifiedDiff(original, s)
+	adds, removes := diffStats(diff)
+	if adds != 0 || removes != 1 {
+		t.Fatalf("expected a single-line surgical removal, got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+}
