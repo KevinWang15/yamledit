@@ -1012,21 +1012,6 @@ func setAnyAtPath(ms gyaml.MapSlice, path []string, key string, val interface{})
 	return ms
 }
 
-// orderedApplyFn walks/edits a heterogenous structure: gyaml.MapSlice or []interface{}.
-// It returns a possibly-modified structure and whether it changed.
-type orderedApplyFn func(cur interface{}) (interface{}, bool, error)
-
-// mustMapSlice asserts a MapSlice value (or creates one if nil).
-func mustMapSlice(v interface{}) gyaml.MapSlice {
-	if v == nil {
-		return gyaml.MapSlice{}
-	}
-	if ms, ok := v.(gyaml.MapSlice); ok {
-		return ms
-	}
-	return gyaml.MapSlice{}
-}
-
 func keyEquals(k interface{}, want string) bool {
 	switch vv := k.(type) {
 	case string:
@@ -1178,7 +1163,7 @@ func marshalBySurgery(
 		}
 
 		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion
-		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx, deletions)
+		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, valIdx, deletions)
 		if !dupPatchesOK {
 			return nil, false
 		}
@@ -1742,7 +1727,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 }
 
 // Ignore duplicate-removal for keys that are explicitly deleted in this op (to avoid overlap).
-func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, ignore map[string]struct{}) (bool, []patch) {
+func buildDuplicateRemovalPatches(original []byte, valIdx map[string][]valueOcc, ignore map[string]struct{}) (bool, []patch) {
 	var patches []patch
 	// For each path+key that had duplicates originally, remove all but the last line
 	for pk, occs := range valIdx {
