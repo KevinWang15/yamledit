@@ -1865,11 +1865,14 @@ func TestApplyJSONPatchArrayReplaceEntry(t *testing.T) {
 
 	diff := unifiedDiff(original, string(out))
 	adds, removes := diffStats(diff)
-	if adds > 1 || removes > 1 {
+	if adds > 2 || removes > 2 {
 		t.Fatalf("expected targeted change, got %d additions / %d removals:\n%s", adds, removes, diff)
 	}
 	if !strings.Contains(string(out), "property: target-new") {
 		t.Fatalf("replacement missing:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "path: data/apps/prod") || strings.Contains(string(out), "path: data/apps/prod-old") {
+		t.Fatalf("path not updated correctly:\n%s", string(out))
 	}
 	if !strings.Contains(string(out), "notes: keep-me") {
 		t.Fatalf("unrelated sections changed:\n%s", string(out))
