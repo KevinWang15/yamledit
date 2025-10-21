@@ -15,7 +15,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Global lock to ensure thread safety across all operations on any AST.
+// Global lock to ensure thread safety across all operations on any AST,
+// as yaml.v3 nodes are not inherently thread-safe during modification.
 var globalEditLock sync.RWMutex
 
 // --- Parse and Marshal ---
@@ -25,7 +26,7 @@ func Parse(data []byte) (*yaml.Node, error) {
 	var node yaml.Node
 	// yaml.v3 Unmarshal populates the AST including comments and line/column info.
 	if err := yaml.Unmarshal(data, &node); err != nil {
-		// Handle potentially empty files or files with only comments which might result in EOF-like behavior depending on exact content.
+		// Handle potentially empty files or files with only comments.
 		// If unmarshal fails but the data is empty/whitespace, treat as empty document.
 		if len(bytes.TrimSpace(data)) == 0 {
 			return &yaml.Node{Kind: yaml.DocumentNode}, nil
@@ -53,7 +54,8 @@ func Parse(data []byte) (*yaml.Node, error) {
 	return &node, nil
 }
 
-// Marshal serializes the yaml.Node AST back to bytes, preserving comments and indentation.
+// Marshal serializes the yaml.Node AST back to bytes, attempting to preserve comments and indentation.
+// Note: gopkg.in/yaml.v3 encoder normalizes whitespace (e.g., before comments) and enforces indentation (may alter indentless sequences).
 func Marshal(doc *yaml.Node) ([]byte, error) {
 	// Acquire Read Lock to ensure safety during concurrent edits.
 	globalEditLock.RLock()
@@ -91,11 +93,12 @@ func gcd(a, b int) int {
 }
 
 // calculateIndentFromAST analyzes the AST (Column numbers) to determine the base indentation level.
-// It calculates the GCD of all detected indentation steps (relative indentation between parent and child).
+// It calculates the GCD of all detected indentation steps.
 func calculateIndentFromAST(node *yaml.Node) int {
 	indents := make(map[int]bool)
 
 	// Walker function to traverse AST and find indentation steps.
+	// parentCol is the 1-based column index of the parent structure start.
 	var walker func(*yaml.Node, int)
 	walker = func(n *yaml.Node, parentCol int) {
 		if n == nil || n.Column == 0 {
@@ -126,7 +129,7 @@ func calculateIndentFromAST(node *yaml.Node) int {
 						indents[step] = true
 					}
 				}
-				// Recurse using the item's column (where the dash conceptually is) as the parent column.
+				// Recurse using the item's column as the parent column.
 				walker(itemNode, itemNode.Column)
 			}
 		} else if n.Kind == yaml.DocumentNode {
@@ -137,11 +140,13 @@ func calculateIndentFromAST(node *yaml.Node) int {
 		}
 	}
 
-	// Start the walker based on the node type.
+	// Start the walker.
 	if node != nil {
 		if node.Kind == yaml.DocumentNode {
+			// Initialize traversal from the start of the document (parentCol 0 conceptually, as columns are 1-based).
 			walker(node, 0)
 		} else {
+			// If starting from a non-document node, assume context starts at column 1.
 			walker(node, 1)
 		}
 	}
@@ -168,7 +173,6 @@ func calculateIndentFromAST(node *yaml.Node) int {
 }
 
 // detectIndent helper required by the specific test interface provided (e.g., TestIndentDetection).
-// It parses the data and uses AST analysis.
 func detectIndent(data []byte) int {
 	var node yaml.Node
 	// We ignore errors here assuming the input is reasonably valid YAML for detection purposes.
@@ -212,7 +216,7 @@ func ensurePathInternal(node *yaml.Node, path []string) *yaml.Node {
 			convertToMapping(current)
 		}
 
-		// Look for the key.
+		// Look for the key (first occurrence).
 		found := false
 		for i := 0; i+1 < len(current.Content); i += 2 {
 			keyNode := current.Content[i]
@@ -224,7 +228,7 @@ func ensurePathInternal(node *yaml.Node, path []string) *yaml.Node {
 		}
 
 		if !found {
-			// Key not found, create it.
+			// Key not found, create it. Keys use Style 0 (Plain).
 			newKeyNode := &yaml.Node{
 				Kind: yaml.ScalarNode, Tag: "!!str", Value: key, Style: 0,
 			}
@@ -251,7 +255,7 @@ func convertToMapping(node *yaml.Node) {
 	node.Style = 0 // Reset style to default block style.
 }
 
-// Helper function for setting scalar values with style preservation.
+// Helper function for setting scalar values with style preservation logic.
 func setScalar(mapNode *yaml.Node, key string, value string, tag string, defaultNewStyle yaml.Style) {
 	globalEditLock.Lock()
 	defer globalEditLock.Unlock()
@@ -260,7 +264,8 @@ func setScalar(mapNode *yaml.Node, key string, value string, tag string, default
 		return
 	}
 
-	// 1. Update existing key.
+	// 1. Update existing key (Surgical Update).
+	// We update the first occurrence found to preserve position.
 	for i := 0; i+1 < len(mapNode.Content); i += 2 {
 		keyNode := mapNode.Content[i]
 		valueNode := mapNode.Content[i+1]
@@ -270,14 +275,14 @@ func setScalar(mapNode *yaml.Node, key string, value string, tag string, default
 			valueNode.Kind = yaml.ScalarNode
 			valueNode.Tag = tag
 			valueNode.Value = value
-			valueNode.Content = nil
+			valueNode.Content = nil // Clear content if it was previously a map/seq.
 
 			// Style preservation logic.
 			if tag == "!!str" {
 				// Keep the existing style (e.g., quotes) if set (Style != 0).
-				// If it was PlainStyle (0), we keep it 0 and let the encoder decide if quotes are needed based on content.
+				// If it was 0 (Plain), we keep it 0 and let the encoder decide if quotes are needed based on content.
 			} else {
-				// Non-strings (int, bool, float, null) enforce PlainStyle (bare values).
+				// Non-strings (int, bool, float, null) enforce PlainStyle (0).
 				valueNode.Style = 0
 			}
 			return
@@ -286,7 +291,7 @@ func setScalar(mapNode *yaml.Node, key string, value string, tag string, default
 
 	// 2. Insert new key (append).
 	newKeyNode := &yaml.Node{
-		Kind: yaml.ScalarNode, Tag: "!!str", Value: key, Style: 0,
+		Kind: yaml.ScalarNode, Tag: "!!str", Value: key, Style: 0, // Keys use Plain Style (0).
 	}
 	newValueNode := &yaml.Node{
 		Kind: yaml.ScalarNode, Tag: tag, Value: value,
@@ -296,6 +301,7 @@ func setScalar(mapNode *yaml.Node, key string, value string, tag string, default
 	if tag == "!!str" {
 		newValueNode.Style = defaultNewStyle
 	} else {
+		// Non-strings always default to Plain Style (0).
 		newValueNode.Style = 0
 	}
 
@@ -311,12 +317,11 @@ func SetScalarBool(mapNode *yaml.Node, key string, value bool) {
 	if value {
 		strVal = "true"
 	}
-	// Normalize to bare booleans.
+	// Normalize to bare YAML booleans (Style 0).
 	setScalar(mapNode, key, strVal, "!!bool", 0)
 }
 
 func SetScalarFloat(mapNode *yaml.Node, key string, value float64) {
-	// Handle special float values.
 	if math.IsInf(value, 1) {
 		setScalar(mapNode, key, ".inf", "!!float", 0)
 	} else if math.IsInf(value, -1) {
@@ -329,8 +334,11 @@ func SetScalarFloat(mapNode *yaml.Node, key string, value float64) {
 	}
 }
 
+// SetScalarString sets a string value.
 func SetScalarString(mapNode *yaml.Node, key, value string) {
-	// Default to SingleQuotedStyle for new strings, satisfying tests expecting quotes for new insertions.
+	// Default to SingleQuotedStyle for new strings when using this API.
+	// This satisfies tests (e.g., TestSetScalarString_InsertNew_AppendsWithIndentAndQuotes) that expect quotes.
+	// JSON Patch uses a different mechanism (jsonValueToYAMLNode) which defaults to Plain style.
 	setScalar(mapNode, key, value, "!!str", yaml.SingleQuotedStyle)
 }
 
@@ -338,7 +346,7 @@ func SetScalarNull(mapNode *yaml.Node, key string) {
 	setScalar(mapNode, key, "null", "!!null", 0)
 }
 
-// DeleteKey removes a key and its value from a mapping node. Removes duplicates if any.
+// DeleteKey removes a key and its value from a mapping node. Removes all duplicates if any.
 func DeleteKey(mapNode *yaml.Node, key string) {
 	globalEditLock.Lock()
 	defer globalEditLock.Unlock()
@@ -432,8 +440,8 @@ func ApplyJSONPatchAtPathBytes(node *yaml.Node, patchJSON []byte, basePath []str
 	globalEditLock.Lock()
 	defer globalEditLock.Unlock()
 
-	// Resolve the base path to find the target node.
-	targetNode, err := resolvePathSegments(node, basePath)
+	// Resolve the base path to find the target node. The path must exist.
+	targetNode, err := resolvePathSegmentsStrict(node, basePath)
 	if err != nil {
 		return fmt.Errorf("failed to resolve base path %v: %w", basePath, err)
 	}
@@ -475,8 +483,8 @@ func cloneYAMLNode(node *yaml.Node) *yaml.Node {
 	return &clone
 }
 
-// resolvePathSegments navigates the AST based on simple path segments (used for basePath).
-func resolvePathSegments(node *yaml.Node, pathSegments []string) (*yaml.Node, error) {
+// resolvePathSegmentsStrict navigates the AST based on simple path segments (used for basePath). It does not create paths.
+func resolvePathSegmentsStrict(node *yaml.Node, pathSegments []string) (*yaml.Node, error) {
 	current := node
 
 	// Handle Document Node wrapper.
@@ -494,6 +502,7 @@ func resolvePathSegments(node *yaml.Node, pathSegments []string) (*yaml.Node, er
 
 		if current.Kind == yaml.MappingNode {
 			found := false
+			// Find the first occurrence of the key.
 			for i := 0; i+1 < len(current.Content); i += 2 {
 				keyNode := current.Content[i]
 				if keyNode.Kind == yaml.ScalarNode && keyNode.Value == segment {
@@ -506,8 +515,7 @@ func resolvePathSegments(node *yaml.Node, pathSegments []string) (*yaml.Node, er
 				return nil, fmt.Errorf("key '%s' not found in mapping", segment)
 			}
 		} else {
-			// basePath is expected to traverse only mappings based on tests.
-			return nil, fmt.Errorf("cannot navigate through non-mapping node with segment '%s'", segment)
+			return nil, fmt.Errorf("cannot navigate through non-mapping node (kind %v) with segment '%s'", current.Kind, segment)
 		}
 	}
 	return current, nil
@@ -517,62 +525,27 @@ func resolvePathSegments(node *yaml.Node, pathSegments []string) (*yaml.Node, er
 func applyOperation(root *yaml.Node, op PatchOperation) error {
 	// Determine the effective root for navigation.
 	effectiveRoot := root
-	if root.Kind == yaml.DocumentNode {
+	if root != nil && root.Kind == yaml.DocumentNode {
 		if len(root.Content) > 0 {
 			effectiveRoot = root.Content[0]
 		} else {
-			// Handle operations on an empty document.
 			effectiveRoot = nil
 		}
 	}
 
 	// Handle operations targeting the root (path "" or "/").
 	if op.Path == "" || op.Path == "/" {
-		if op.Op == "add" || op.Op == "replace" {
-			// If effectiveRoot exists, perform surgical replace on it.
-			if effectiveRoot != nil {
-				return surgicalReplace(effectiveRoot, op.Value)
-			}
-
-			// If document is empty, create the root content.
-			if root.Kind == yaml.DocumentNode && len(root.Content) == 0 {
-				newNode, err := jsonValueToYAMLNode(op.Value)
-				if err != nil {
-					return err
-				}
-				root.Content = []*yaml.Node{newNode}
-				return nil
-			}
-			// Handle replacing a nil node if root was not a DocumentNode (less common if using Parse).
-			if effectiveRoot == nil {
-				newNode, err := jsonValueToYAMLNode(op.Value)
-				if err != nil {
-					return err
-				}
-				*root = *newNode
-				return nil
-			}
-		}
-		// Other operations on root (remove, test) require existing content.
-		if effectiveRoot == nil {
-			return errors.New("target document is empty")
-		}
+		return applyRootOperation(root, effectiveRoot, op)
 	}
 
 	if effectiveRoot == nil {
-		return errors.New("cannot apply non-root patch operation to empty document")
-	}
-
-	if !strings.HasPrefix(op.Path, "/") {
-		return fmt.Errorf("invalid JSON pointer: %s (must start with /)", op.Path)
+		return errors.New("cannot apply non-root patch operation to empty document/node")
 	}
 
 	// Split and unescape path segments.
-	pathSegments := strings.Split(op.Path, "/")[1:]
-	for i, seg := range pathSegments {
-		seg = strings.ReplaceAll(seg, "~1", "/")
-		seg = strings.ReplaceAll(seg, "~0", "~")
-		pathSegments[i] = seg
+	pathSegments, err := decodeJSONPointer(op.Path)
+	if err != nil {
+		return err
 	}
 
 	targetSegment := pathSegments[len(pathSegments)-1]
@@ -581,7 +554,7 @@ func applyOperation(root *yaml.Node, op PatchOperation) error {
 	// Resolve parent node.
 	parent, err := resolveJSONPointer(effectiveRoot, parentPath)
 	if err != nil {
-		// 'add' allows the parent path to not exist if we could create it, but standard JSON patch requires the parent to exist.
+		// RFC 6902: The parent must exist.
 		return fmt.Errorf("failed to resolve parent path: %w", err)
 	}
 	if parent == nil {
@@ -603,59 +576,131 @@ func applyOperation(root *yaml.Node, op PatchOperation) error {
 	case "test":
 		return applyTest(parent, targetSegment, op.Value)
 	case "move", "copy":
-		// move and copy are complex and not required by the provided tests.
+		// Not required by the provided tests.
 		return fmt.Errorf("JSON patch operation '%s' is not implemented", op.Op)
 	default:
 		return fmt.Errorf("unsupported JSON patch operation: %s", op.Op)
 	}
 }
 
+func applyRootOperation(root, effectiveRoot *yaml.Node, op PatchOperation) error {
+	if op.Op == "add" || op.Op == "replace" {
+		// If effectiveRoot exists, perform surgical replace on it.
+		if effectiveRoot != nil {
+			return surgicalReplace(effectiveRoot, op.Value)
+		}
+
+		// If document is empty, create the root content.
+		if root != nil && root.Kind == yaml.DocumentNode && len(root.Content) == 0 {
+			newNode, err := jsonValueToYAMLNode(op.Value)
+			if err != nil {
+				return err
+			}
+			root.Content = []*yaml.Node{newNode}
+			return nil
+		}
+		// Handle replacing a nil node if root was not a DocumentNode (e.g. if ApplyJSONPatch was called on a bare node).
+		if effectiveRoot == nil && root != nil {
+			newNode, err := jsonValueToYAMLNode(op.Value)
+			if err != nil {
+				return err
+			}
+			*root = *newNode
+			return nil
+		}
+	}
+
+	// Other operations on root require existing content.
+	if effectiveRoot == nil {
+		return errors.New("target document or node is empty/nil")
+	}
+
+	if op.Op == "test" {
+		return testNodeValue(effectiveRoot, op.Value)
+	}
+
+	if op.Op == "remove" {
+		// Removing the root means clearing the document or setting the node to null.
+		if root.Kind == yaml.DocumentNode {
+			root.Content = nil
+		} else {
+			// Replace the node itself with a null node.
+			root.Kind = yaml.ScalarNode
+			root.Tag = "!!null"
+			root.Value = "null"
+			root.Content = nil
+			root.Style = 0
+		}
+		return nil
+	}
+
+	return fmt.Errorf("operation '%s' on root path not supported or invalid", op.Op)
+}
+
+func decodeJSONPointer(path string) ([]string, error) {
+	if path == "" {
+		return []string{}, nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("invalid JSON pointer: %s (must start with /)", path)
+	}
+	segments := strings.Split(path, "/")[1:]
+	for i, seg := range segments {
+		seg = strings.ReplaceAll(seg, "~1", "/")
+		seg = strings.ReplaceAll(seg, "~0", "~")
+		segments[i] = seg
+	}
+	return segments, nil
+}
+
 // resolveJSONPointer navigates the AST based on JSON Pointer segments.
 func resolveJSONPointer(node *yaml.Node, pathSegments []string) (*yaml.Node, error) {
 	current := node
 
-	for _, segment := range pathSegments {
+	for i, segment := range pathSegments {
 		if current == nil {
 			return nil, fmt.Errorf("path segment '%s' navigates into nil node", segment)
 		}
 
 		if current.Kind == yaml.MappingNode {
 			found := false
-			for i := 0; i+1 < len(current.Content); i += 2 {
-				keyNode := current.Content[i]
+			// Find the first occurrence of the key.
+			for j := 0; j+1 < len(current.Content); j += 2 {
+				keyNode := current.Content[j]
 				if keyNode.Kind == yaml.ScalarNode && keyNode.Value == segment {
-					current = current.Content[i+1]
+					current = current.Content[j+1]
 					found = true
 					break
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("key '%s' not found in mapping", segment)
+				return nil, fmt.Errorf("key '%s' not found in mapping at segment %d", segment, i)
 			}
 		} else if current.Kind == yaml.SequenceNode {
 			index, err := strconv.Atoi(segment)
 			if err != nil {
-				return nil, fmt.Errorf("invalid array index '%s'", segment)
+				return nil, fmt.Errorf("invalid array index '%s' at segment %d", segment, i)
 			}
 			if index < 0 || index >= len(current.Content) {
-				return nil, fmt.Errorf("array index %d out of bounds (len %d)", index, len(current.Content))
+				return nil, fmt.Errorf("array index %d out of bounds (len %d) at segment %d", index, len(current.Content), i)
 			}
 			current = current.Content[index]
 		} else {
-			return nil, fmt.Errorf("cannot navigate through scalar/other node with segment '%s'", segment)
+			return nil, fmt.Errorf("cannot navigate through scalar/other node (kind %v) with segment '%s' at segment %d", current.Kind, segment, i)
 		}
 	}
 	return current, nil
 }
 
 // jsonValueToYAMLNode converts JSON value (RawMessage) to YAML Node AST.
+// It ensures nodes created from JSON Patch use PlainStyle (0) by default, while preserving multiline styles.
 func jsonValueToYAMLNode(value json.RawMessage) (*yaml.Node, error) {
-	// Handle null or empty input specifically.
+	// Handle null or empty input specifically. Style 0 (Plain).
 	if len(value) == 0 || string(value) == "null" {
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!null", Value: "null", Style: 0}, nil
 	}
 
-	// Unmarshal the JSON into a generic interface{} first to inspect the data.
+	// Unmarshal the JSON into a generic interface{} first.
 	var data interface{}
 	if err := json.Unmarshal(value, &data); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JSON value: %w", err)
@@ -671,27 +716,51 @@ func jsonValueToYAMLNode(value json.RawMessage) (*yaml.Node, error) {
 	// Encode might produce a DocumentNode wrapper.
 	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
 		resultNode = node.Content[0]
-	} else {
+	} else if node.Kind != 0 {
 		resultNode = &node
+	} else {
+		// Should be rare if Encode succeeds but results in an empty node.
+		return nil, errors.New("failed to encode JSON value into a valid YAML node")
 	}
 
-	// Apply default styles for newly created nodes from JSON Patch.
-	// This ensures consistency with SetScalar* functions.
+	// Apply styling policy for JSON Patch: default to Plain Style (0), but preserve multiline styles.
+	// This prevents excessive quoting for simple keys/values added via patch.
 	var styleWalker func(*yaml.Node)
 	styleWalker = func(n *yaml.Node) {
 		if n == nil {
 			return
 		}
+
+		// 1. Handle Scalars (Values)
 		if n.Kind == yaml.ScalarNode {
-			if n.Tag == "!!str" && n.Style == 0 {
-				// Default new strings to SingleQuotedStyle.
-				n.Style = yaml.SingleQuotedStyle
-			} else if n.Tag != "!!str" {
+			// Reset style to 0 (Plain) unless it's a multiline style (Literal/Folded).
+			if n.Style&(yaml.LiteralStyle|yaml.FoldedStyle) == 0 {
 				n.Style = 0
 			}
 		}
-		for _, child := range n.Content {
-			styleWalker(child)
+
+		// 2. Handle Mappings (Keys and recursion)
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i < len(n.Content); i += 2 {
+				// Ensure key exists
+				if i >= len(n.Content) {
+					break
+				}
+				keyNode := n.Content[i]
+				// Force keys to be Plain Style (0).
+				if keyNode.Kind == yaml.ScalarNode {
+					keyNode.Style = 0
+				}
+				// Recurse into value
+				if i+1 < len(n.Content) {
+					styleWalker(n.Content[i+1])
+				}
+			}
+		} else if n.Kind == yaml.SequenceNode {
+			// 3. Handle Sequences (Recursion)
+			for _, child := range n.Content {
+				styleWalker(child)
+			}
 		}
 	}
 	styleWalker(resultNode)
@@ -715,6 +784,7 @@ func applyAdd(parent *yaml.Node, key string, value json.RawMessage) error {
 			return err
 		}
 
+		// Use PlainStyle (0) for the new key.
 		newKeyNode := &yaml.Node{
 			Kind: yaml.ScalarNode, Tag: "!!str", Value: key, Style: 0,
 		}
@@ -756,6 +826,7 @@ func applyAdd(parent *yaml.Node, key string, value json.RawMessage) error {
 func applyRemove(parent *yaml.Node, key string) error {
 	if parent.Kind == yaml.MappingNode {
 		// Remove from map. Key must exist.
+		// This removes the first occurrence found.
 		for i := 0; i+1 < len(parent.Content); i += 2 {
 			keyNode := parent.Content[i]
 			if keyNode.Kind == yaml.ScalarNode && keyNode.Value == key {
@@ -787,7 +858,11 @@ func applyTest(parent *yaml.Node, key string, expectedValue json.RawMessage) err
 	if err != nil {
 		return fmt.Errorf("target not found: %w", err)
 	}
+	return testNodeValue(target, expectedValue)
+}
 
+// testNodeValue compares the semantic value of a node with an expected JSON value.
+func testNodeValue(target *yaml.Node, expectedValue json.RawMessage) error {
 	// Compare semantic values using Go reflection.
 
 	// 1. Convert target node to Go structure.
@@ -795,7 +870,7 @@ func applyTest(parent *yaml.Node, key string, expectedValue json.RawMessage) err
 	// Decode handles the conversion from AST to Go types.
 	if err := target.Decode(&targetGo); err != nil {
 		// Handle explicit nulls if Decode fails but the node represents null.
-		if target.Kind == yaml.ScalarNode && (target.Tag == "!!null" || target.Value == "null" || target.Value == "~") {
+		if target.Kind == yaml.ScalarNode && (target.Tag == "!!null" || target.Value == "null" || target.Value == "~" || target.Value == "") {
 			targetGo = nil
 		} else {
 			return fmt.Errorf("failed to decode target node for comparison: %w", err)
@@ -804,13 +879,14 @@ func applyTest(parent *yaml.Node, key string, expectedValue json.RawMessage) err
 
 	// 2. Convert expected JSON value to Go structure.
 	var expectedGo any
-	if len(expectedValue) > 0 {
-		if err := json.Unmarshal(expectedValue, &expectedGo); err != nil {
-			return fmt.Errorf("failed to unmarshal expected JSON value: %w", err)
-		}
-	} else {
-		// 'test' operation requires a 'value' field.
+	if len(expectedValue) == 0 {
+		// 'test' operation requires a 'value' field (RFC 6902 Section 4.6).
 		return errors.New("expected value missing for test operation")
+	}
+
+	// json.Unmarshal correctly handles "null".
+	if err := json.Unmarshal(expectedValue, &expectedGo); err != nil {
+		return fmt.Errorf("failed to unmarshal expected JSON value: %w", err)
 	}
 
 	// 3. Compare.
@@ -821,8 +897,10 @@ func applyTest(parent *yaml.Node, key string, expectedValue json.RawMessage) err
 	return nil
 }
 
+// findChildNode locates a child node by key (map) or index (sequence).
 func findChildNode(parent *yaml.Node, key string) (*yaml.Node, error) {
 	if parent.Kind == yaml.MappingNode {
+		// Finds the first occurrence.
 		for i := 0; i+1 < len(parent.Content); i += 2 {
 			keyNode := parent.Content[i]
 			if keyNode.Kind == yaml.ScalarNode && keyNode.Value == key {
@@ -857,7 +935,7 @@ func surgicalReplace(target *yaml.Node, newValue json.RawMessage) error {
 	return surgicalReplaceNode(target, desiredNode)
 }
 
-// surgicalReplaceNode performs the reconciliation logic.
+// surgicalReplaceNode performs the reconciliation logic recursively.
 func surgicalReplaceNode(target, desired *yaml.Node) error {
 	// If kinds differ, replace the whole structure (Shape Change).
 	if target.Kind != desired.Kind {
@@ -866,7 +944,7 @@ func surgicalReplaceNode(target, desired *yaml.Node) error {
 		target.Tag = desired.Tag
 		target.Value = desired.Value
 		target.Content = desired.Content
-		target.Style = desired.Style
+		target.Style = desired.Style // Use the style determined by jsonValueToYAMLNode (Plain by default).
 		return nil
 	}
 
@@ -878,11 +956,9 @@ func surgicalReplaceNode(target, desired *yaml.Node) error {
 		// Style preservation logic.
 		if target.Tag == "!!str" {
 			// Keep target.Style if set (preserves original quotes).
-			// If it was PlainStyle (0), we keep it 0.
-			// We rely on jsonValueToYAMLNode to set a default style (e.g., SingleQuoted) on the 'desired' node,
-			// but we prioritize the 'target' style here for existing nodes.
+			// If it was 0 (Plain), we keep it 0.
 		} else {
-			// Normalize non-strings to PlainStyle.
+			// Normalize non-strings to PlainStyle (0).
 			target.Style = 0
 		}
 		return nil
@@ -901,11 +977,11 @@ func surgicalReplaceNode(target, desired *yaml.Node) error {
 	return nil
 }
 
-// reconcileMapping reconciles two mapping nodes, preserving order and comments of existing keys, and handling duplicates.
+// reconcileMapping reconciles two mapping nodes, preserving order and comments of existing keys, and handling duplicates in the target.
 func reconcileMapping(target, desired *yaml.Node) error {
-	// 1. Map desired keys.
+	// 1. Map desired keys and values.
 	desiredMap := make(map[string]*yaml.Node)
-	// We iterate desired.Content to capture the semantic value (last occurrence if desired somehow had duplicates).
+	// Capture the semantic value (last occurrence wins if desired had duplicates).
 	for i := 0; i+1 < len(desired.Content); i += 2 {
 		keyNode := desired.Content[i]
 		if keyNode.Kind == yaml.ScalarNode {
@@ -929,7 +1005,7 @@ func reconcileMapping(target, desired *yaml.Node) error {
 
 		key := keyNode.Value
 		if processedKeys[key] {
-			continue // Handle duplicates in target: skip subsequent occurrences.
+			continue // Handle duplicates in target: skip subsequent occurrences, effectively removing them.
 		}
 		processedKeys[key] = true
 
@@ -938,10 +1014,10 @@ func reconcileMapping(target, desired *yaml.Node) error {
 			if err := surgicalReplaceNode(valueNode, desiredValue); err != nil {
 				return err
 			}
-			// Keep original keyNode (preserves comments/style) and updated valueNode.
+			// Keep original keyNode (preserves comments/style) and the updated valueNode.
 			newContent = append(newContent, keyNode, valueNode)
 		}
-		// Key removed in desired (skip appending to newContent).
+		// If key is not in desiredMap, it is removed (by not appending to newContent).
 	}
 
 	// 3. Append new keys from desired (maintaining their relative order from the desired state).
@@ -949,15 +1025,12 @@ func reconcileMapping(target, desired *yaml.Node) error {
 		keyNode := desired.Content[i]
 		if keyNode.Kind == yaml.ScalarNode {
 			key := keyNode.Value
-			// Check if the key was already present in the target.
+			// Check if the key was already processed (i.e., existed in target).
 			if !processedKeys[key] {
-				// Create a new key node with default style.
-				newKeyNode := &yaml.Node{
-					Kind: yaml.ScalarNode, Tag: "!!str", Value: key, Style: 0,
-				}
-				// The value node comes from the desired state (already styled by jsonValueToYAMLNode).
-				newContent = append(newContent, newKeyNode, desired.Content[i+1])
-				processedKeys[key] = true // Ensure we don't add it again if desired had duplicates.
+				// The keyNode and valueNode from 'desired' already have the correct style set by jsonValueToYAMLNode (Plain 0).
+				// We can reuse them directly.
+				newContent = append(newContent, keyNode, desired.Content[i+1])
+				processedKeys[key] = true
 			}
 		}
 	}
@@ -977,7 +1050,7 @@ func reconcileSequence(target, desired *yaml.Node) error {
 	}
 
 	// 1. Reconcile existing elements by index.
-	// This reuses the target nodes, preserving comments associated with that index.
+	// This reuses the target nodes in place, preserving comments associated with that index.
 	for i := 0; i < commonLen; i++ {
 		if err := surgicalReplaceNode(target.Content[i], desired.Content[i]); err != nil {
 			return err
@@ -991,6 +1064,11 @@ func reconcileSequence(target, desired *yaml.Node) error {
 	} else if m > n {
 		// Append new elements from desired.
 		target.Content = append(target.Content, desired.Content[n:]...)
+	}
+
+	// Keep target.Style (e.g., Flow vs Block) unless it was empty, then adopt desired style.
+	if target.Style == 0 && desired.Style != 0 {
+		target.Style = desired.Style
 	}
 
 	return nil

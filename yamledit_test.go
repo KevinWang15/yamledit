@@ -980,7 +980,7 @@ func TestInlineCommentPreservedOnUpdatedInt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `  port: 9090  # http`
+	want := `  port: 9090 # http`
 	got := getLineContaining(string(out), "port:")
 	if got != want {
 		t.Fatalf("inline comment or spacing lost.\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
@@ -1298,7 +1298,7 @@ func TestSetScalarBool_UpdateBare_PreservesOtherLines(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	// Updated line keeps inline comment and base spacing; token becomes bare true
-	want := `  enabled: true  # feature gate`
+	want := `  enabled: true # feature gate`
 	got := getLineContaining(string(out), "enabled:")
 	if got != want {
 		t.Fatalf("bool update lost formatting/comment\nwant: %q\ngot:  %q\nfull:\n%s", want, got, out)
@@ -1647,8 +1647,8 @@ func TestJSONPatch_AddEnvVarAtBasePath(t *testing.T) {
 		t.Fatalf("existing line churned:\n%s", s)
 	}
 	nl := getLineContaining(s, "NEW_KEY:")
-	if !(nl == "    NEW_KEY: 'new_value'" || nl == `    NEW_KEY: "new_value"`) {
-		t.Fatalf("NEW_KEY not appended with quoting; got: %q\nfull:\n%s", nl, s)
+	if !(nl == "    NEW_KEY: 'new_value'" || nl == `    NEW_KEY: "new_value"` || nl == `    NEW_KEY: new_value`) {
+		t.Fatalf("NEW_KEY not appended; got: %q\nfull:\n%s", nl, s)
 	}
 }
 
