@@ -49,14 +49,23 @@ type docState struct {
 }
 
 // Information about a sequence under a mapping path in the original YAML.
+type seqItemInfo struct {
+	name  string // value of "name" key if available
+	start int    // byte offset at the beginning of the item's first line ("- " ...)
+	end   int    // byte offset of the newline ending the last line of the item
+}
+
 type seqInfo struct {
 	indent         int // spaces before '-' on the first line of an item
 	itemKVIndent   int // spaces for subsequent key lines inside an item
+	firstItemStart int // byte offset of the first item's line start
 	lastItemEnd    int // byte offset of the newline ending the last item's last line
 	hasAnyItem     bool
 	originalPath   bool
-	firstKeyInline bool     // whether first key appears on the same line as "- "
-	keyOrder       []string // preferred key order for items (captured from an existing item)
+	firstKeyInline bool          // whether first key appears on the same line as "- "
+	keyOrder       []string      // preferred key order for items (captured from an existing item)
+	items          []seqItemInfo // per-item positions and names
+	gaps           [][]byte      // raw bytes between items; len = len(items)-1
 }
 
 func cloneSeqIndex(in map[string]*seqInfo) map[string]*seqInfo {
@@ -64,6 +73,18 @@ func cloneSeqIndex(in map[string]*seqInfo) map[string]*seqInfo {
 	for k, v := range in {
 		cp := *v
 		cp.keyOrder = append([]string(nil), v.keyOrder...)
+		if v.items != nil {
+			cp.items = make([]seqItemInfo, len(v.items))
+			copy(cp.items, v.items)
+		}
+		if v.gaps != nil {
+			cp.gaps = make([][]byte, len(v.gaps))
+			for i := range v.gaps {
+				if v.gaps[i] != nil {
+					cp.gaps[i] = append([]byte(nil), v.gaps[i]...)
+				}
+			}
+		}
 		out[k] = &cp
 	}
 	return out
@@ -245,24 +266,68 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 		return
 	}
 	si.hasAnyItem = true
-	lastIdx := len(seq.Content) - 1
-	item := seq.Content[lastIdx]
-	// Default lastItemEnd to the last scalar line in this item.
-	lastEnd := 0
-	if item.Kind == yaml.MappingNode {
-		// Derive indent and inline style from the first key line.
-		if len(item.Content) >= 2 {
-			firstK := item.Content[0]
+	// First item start anchor
+	first := seq.Content[0]
+	if first.Kind == yaml.MappingNode && len(first.Content) >= 2 {
+		fk := first.Content[0]
+		si.firstItemStart = lineStartOffset(st.lineOffsets, fk.Line)
+	} else {
+		si.firstItemStart = lineStartOffset(st.lineOffsets, first.Line)
+	}
+	// Per‑item boundaries and names
+	si.items = si.items[:0]
+	// Detect style/indent/key order from the FIRST mapping item we see (for stability).
+	detectedStyle := false
+	computeItemBounds := func(it *yaml.Node) (start int, end int, name string) {
+		// start
+		if it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
+			fk := it.Content[0]
+			start = lineStartOffset(st.lineOffsets, fk.Line)
+		} else {
+			start = lineStartOffset(st.lineOffsets, it.Line)
+		}
+		// end
+		if it.Kind == yaml.MappingNode {
+			maxEnd := 0
+			for j := 0; j+1 < len(it.Content); j += 2 {
+				if it.Content[j+1] == nil {
+					continue
+				}
+				vs := offsetFor(st.lineOffsets, it.Content[j+1].Line, it.Content[j+1].Column)
+				if vs >= 0 && vs < len(st.original) {
+					le := findLineEnd(st.original, vs)
+					if le > maxEnd {
+						maxEnd = le
+					}
+				}
+			}
+			end = maxEnd
+		} else {
+			ls := lineStartOffset(st.lineOffsets, it.Line)
+			end = findLineEnd(st.original, ls)
+		}
+		// name (best-effort)
+		if it.Kind == yaml.MappingNode {
+			for j := 0; j+1 < len(it.Content); j += 2 {
+				k := it.Content[j]
+				v := it.Content[j+1]
+				if k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode {
+					name = v.Value
+					break
+				}
+			}
+		}
+		// Detect style/indent/key order once from a mapping item
+		if !detectedStyle && it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
+			firstK := it.Content[0]
 			ls := lineStartOffset(st.lineOffsets, firstK.Line)
 			le := findLineEnd(st.original, ls)
 			ln := st.original[ls:le]
 			si.indent = leadingSpaces(ln)
 			si.firstKeyInline = firstNonSpaceByte(ln) == '-'
-			// Compute kv indent (subsequent lines) as min leading spaces among key lines that
-			// are not on "- " lines; fallback to indent+base indent later.
 			kvIndent := 0
-			for j := 0; j+1 < len(item.Content); j += 2 {
-				k := item.Content[j]
+			for j := 0; j+1 < len(it.Content); j += 2 {
+				k := it.Content[j]
 				ks := lineStartOffset(st.lineOffsets, k.Line)
 				ke := findLineEnd(st.original, ks)
 				kl := st.original[ks:ke]
@@ -275,38 +340,50 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 				}
 			}
 			if kvIndent == 0 {
-				// approximate; will be corrected at render if needed
 				kvIndent = si.indent + st.indent
 			}
 			si.itemKVIndent = kvIndent
-			// Key order from this item
-			order := make([]string, 0, len(item.Content)/2)
-			for j := 0; j+1 < len(item.Content); j += 2 {
-				if item.Content[j].Kind == yaml.ScalarNode {
-					order = append(order, item.Content[j].Value)
+			order := make([]string, 0, len(it.Content)/2)
+			for j := 0; j+1 < len(it.Content); j += 2 {
+				if it.Content[j].Kind == yaml.ScalarNode {
+					order = append(order, it.Content[j].Value)
 				}
 			}
 			si.keyOrder = order
+			detectedStyle = true
 		}
-		for j := 0; j+1 < len(item.Content); j += 2 {
-			v := item.Content[j+1]
-			vs := offsetFor(st.lineOffsets, v.Line, v.Column)
-			if vs >= 0 && vs < len(st.original) {
-				le := findLineEnd(st.original, vs)
-				if le > lastEnd {
-					lastEnd = le
-				}
+		return
+	}
+	// First item start
+	first = seq.Content[0]
+	fs, _, _ := computeItemBounds(first)
+	si.firstItemStart = fs
+	// Items & last end
+	lastEnd := 0
+	si.items = make([]seqItemInfo, 0, len(seq.Content))
+	for _, it := range seq.Content {
+		s, e, nm := computeItemBounds(it)
+		if e > lastEnd {
+			lastEnd = e
+		}
+		si.items = append(si.items, seqItemInfo{name: nm, start: s, end: e})
+	}
+	si.lastItemEnd = lastEnd
+	// Gaps between items (raw)
+	if len(si.items) >= 2 {
+		si.gaps = make([][]byte, len(si.items)-1)
+		for i := 0; i < len(si.items)-1; i++ {
+			gStart := si.items[i].end + 1
+			gEnd := si.items[i+1].start
+			if gStart >= 0 && gEnd >= gStart && gEnd <= len(st.original) {
+				si.gaps[i] = append([]byte(nil), st.original[gStart:gEnd]...)
+			} else {
+				si.gaps[i] = nil
 			}
 		}
 	} else {
-		// Non-mapping item; anchor at its line end.
-		ls := lineStartOffset(st.lineOffsets, item.Line)
-		lastEnd = findLineEnd(st.original, ls)
-		si.indent = leadingSpaces(st.original[ls:lastEnd])
-		si.itemKVIndent = 0
-		si.firstKeyInline = true
+		si.gaps = nil
 	}
-	si.lastItemEnd = lastEnd
 }
 
 // Marshal encodes the YAML. Prefer byte-surgical patching when safe; otherwise fall back.
@@ -339,26 +416,17 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	arraysDirty := st.arraysDirty
 	st.mu.RUnlock()
 
-	// If arrays were edited, structured encode is required (surgery doesn't handle seq edits).
-	if arraysDirty {
-		var buf bytes.Buffer
-		enc := gyaml.NewEncoder(&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments))
-		if err := enc.Encode(ordered); err != nil {
-			_ = enc.Close()
-			return nil, err
-		}
-		_ = enc.Close()
-		// clear the flag now that we've materialized the change
-		if s, ok := lookup(doc); ok {
-			s.mu.Lock()
-			s.arraysDirty = false
-			s.mu.Unlock()
-		}
-		return buf.Bytes(), nil
-	}
-	// Attempt byte-surgical patching first
+	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
 	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, delSet)
 	if okPatch {
+		// clear the flag if we succeeded surgically
+		if arraysDirty {
+			if s, ok := lookup(doc); ok {
+				s.mu.Lock()
+				s.arraysDirty = false
+				s.mu.Unlock()
+			}
+		}
 		return out, nil
 	}
 
@@ -1149,10 +1217,20 @@ func marshalBySurgery(
 	for ok := range []int{0} {
 		_ = ok                             // keep the block to allow early returns neatly
 		mutableMI := cloneMapIndex(mapIdx) // local copy to advance insertion anchors
+		// Replace entire sequence blocks when array "shape" changed (remove/add/reorder)
+		seqReplOK, seqReplPatches, replacedSeqs := buildSeqReplaceBlockPatches(original, current, originalOrdered, seqIdx, baseIndent)
+		if !seqReplOK {
+			return nil, false
+		}
+		for _, p := range seqReplPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
 		//    including inside arrays of mappings.
-		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx, seqIdx)
+		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx, seqIdx, replacedSeqs)
 		if !replaceOK {
 			return nil, false
 		}
@@ -1163,7 +1241,7 @@ func marshalBySurgery(
 		}
 
 		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion
-		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, valIdx, deletions)
+		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx, deletions, replacedSeqs)
 		if !dupPatchesOK {
 			return nil, false
 		}
@@ -1185,7 +1263,8 @@ func marshalBySurgery(
 		}
 
 		// 3b) Append NEW items to sequences (arrays) at the end (safe styles only).
-		seqOK, seqPatches := buildSeqAppendPatches(original, current, originalOrdered, seqIdx, baseIndent)
+		//     Skip sequences we fully replaced above.
+		seqOK, seqPatches := buildSeqAppendPatches(original, current, originalOrdered, seqIdx, baseIndent, replacedSeqs)
 		if !seqOK {
 			return nil, false
 		}
@@ -1280,12 +1359,14 @@ func toPlain(v interface{}) interface{} {
 }
 
 // Build patches for appending new items to sequences (arrays) at the end.
+// 'skipSeq' contains sequence paths (joinPath form) which are already replaced entirely.
 func buildSeqAppendPatches(
 	original []byte,
 	current gyaml.MapSlice,
 	originalOrdered gyaml.MapSlice,
 	seqIdx map[string]*seqInfo,
 	baseIndent int,
+	skipSeq map[string]struct{},
 ) (bool, []patch) {
 	var patches []patch
 
@@ -1451,6 +1532,10 @@ func buildSeqAppendPatches(
 					return false
 				}
 			case []interface{}:
+				mpath := joinPath(append(path, k))
+				if _, skip := skipSeq[mpath]; skip {
+					continue
+				}
 				origArr, ok := getArrAtPath(originalOrdered, path, k)
 				if !ok {
 					return false
@@ -1463,7 +1548,7 @@ func buildSeqAppendPatches(
 					continue
 				} // nothing appended
 				// Only handle pure append at end.
-				mpath := joinPath(append(path, k))
+				mpath = joinPath(append(path, k))
 				si := seqIdx[mpath]
 				if si == nil || !si.originalPath || !si.hasAnyItem {
 					return false
@@ -1501,7 +1586,9 @@ func buildSeqAppendPatches(
 	return true, patches
 }
 
-func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, seqIdx map[string]*seqInfo) (bool, []patch) {
+// buildReplacementPatches emits surgical scalar replacements (including inside seq items).
+// If a sequence at some path was fully replaced, skip emitting replacements for its items.
+func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, seqIdx map[string]*seqInfo, skipSeq map[string]struct{}) (bool, []patch) {
 	var patches []patch
 
 	// For sequence items, coalesce multiple scalar changes down to ONE patch,
@@ -1519,6 +1606,11 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 	emit := func(p patch, path []string, key string) {
 		if len(path) > 0 && isIndexSeg(path[len(path)-1]) {
 			itemPath := joinPath(path) // includes the [n]
+			// Skip if this item's sequence was fully replaced.
+			seqPath := joinPath(path[:len(path)-1])
+			if _, skip := skipSeq[seqPath]; skip {
+				return
+			}
 			perItem[itemPath] = append(perItem[itemPath], keyPatch{key: key, patch: p})
 			return
 		}
@@ -1727,12 +1819,21 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 }
 
 // Ignore duplicate-removal for keys that are explicitly deleted in this op (to avoid overlap).
-func buildDuplicateRemovalPatches(original []byte, valIdx map[string][]valueOcc, ignore map[string]struct{}) (bool, []patch) {
+// Also skip duplicates under sequences we fully replaced.
+func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, ignore map[string]struct{}, skipSeq map[string]struct{}) (bool, []patch) {
 	var patches []patch
 	// For each path+key that had duplicates originally, remove all but the last line
+outer:
 	for pk, occs := range valIdx {
 		if _, skip := ignore[pk]; skip {
 			continue
+		}
+		// Skip any pk under a replaced sequence (prefix: "<seqPath>\x00[")
+		for sp := range skipSeq {
+			prefix := sp + pathSep + "["
+			if strings.HasPrefix(pk, prefix) {
+				continue outer
+			}
 		}
 		if len(occs) <= 1 {
 			continue
@@ -1750,6 +1851,300 @@ func buildDuplicateRemovalPatches(original []byte, valIdx map[string][]valueOcc,
 		}
 	}
 	return true, patches
+}
+
+// --- Sequence whole-block replacement when shape changed ---
+
+func buildSeqReplaceBlockPatches(
+	original []byte,
+	current gyaml.MapSlice,
+	originalOrdered gyaml.MapSlice,
+	seqIdx map[string]*seqInfo,
+	baseIndent int,
+) (bool, []patch, map[string]struct{}) {
+	var patches []patch
+	replaced := map[string]struct{}{}
+
+	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
+	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
+		cur := ms
+		for _, seg := range path {
+			found := false
+			for _, it := range cur {
+				ks, ok := it.Key.(string)
+				if ok && ks == seg {
+					if sub, ok2 := it.Value.(gyaml.MapSlice); ok2 {
+						cur = sub
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		}
+		for _, it := range cur {
+			ks, ok := it.Key.(string)
+			if ok && ks == key {
+				if arr, ok2 := it.Value.([]interface{}); ok2 {
+					return arr, true
+				}
+				return nil, false
+			}
+		}
+		return nil, false
+	}
+
+	toMapSlice := func(v interface{}) (gyaml.MapSlice, bool) {
+		switch t := v.(type) {
+		case gyaml.MapSlice:
+			return t, true
+		case map[string]interface{}:
+			ms := gyaml.MapSlice{}
+			for k, vv := range t {
+				ms = append(ms, gyaml.MapItem{Key: k, Value: jsonValueToOrdered(vv)})
+			}
+			return ms, true
+		default:
+			return gyaml.MapSlice{}, false
+		}
+	}
+
+	namesOf := func(arr []interface{}) ([]string, bool) {
+		out := make([]string, len(arr))
+		for i, el := range arr {
+			switch it := el.(type) {
+			case gyaml.MapSlice:
+				found := false
+				for _, kv := range it {
+					if ks, ok := kv.Key.(string); ok && ks == "name" {
+						if sv, ok2 := kv.Value.(string); ok2 {
+							out[i] = sv
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					return nil, false
+				}
+			case map[string]interface{}:
+				if v, ok := it["name"].(string); ok {
+					out[i] = v
+				} else {
+					return nil, false
+				}
+			default:
+				return nil, false
+			}
+		}
+		return out, true
+	}
+
+	getName := func(ms gyaml.MapSlice) string {
+		for _, it := range ms {
+			if ks, ok := it.Key.(string); ok && ks == "name" {
+				if sv, ok2 := it.Value.(string); ok2 {
+					return sv
+				}
+			}
+		}
+		return ""
+	}
+
+	renderScalar := func(v interface{}) string {
+		switch vv := v.(type) {
+		case int:
+			return fmt.Sprintf("%d", vv)
+		case float64:
+			return strconv.FormatFloat(vv, 'g', -1, 64)
+		case bool:
+			if vv {
+				return "true"
+			}
+			return "false"
+		case string:
+			if isSafeBareString(vv) {
+				return vv
+			}
+			return quoteNewStringToken(vv)
+		case nil:
+			return "null"
+		default:
+			s := fmt.Sprint(vv)
+			if isSafeBareString(s) {
+				return s
+			}
+			return quoteNewStringToken(s)
+		}
+	}
+
+	renderItem := func(si *seqInfo, ms gyaml.MapSlice) (string, bool) {
+		vals := map[string]interface{}{}
+		for _, it := range ms {
+			if ks, ok := it.Key.(string); ok {
+				vals[ks] = it.Value
+			}
+		}
+		order := []string{}
+		if len(si.keyOrder) > 0 {
+			order = append(order, si.keyOrder...)
+			for _, it := range ms {
+				ks, _ := it.Key.(string)
+				found := false
+				for _, k := range order {
+					if k == ks {
+						found = true
+						break
+					}
+				}
+				if !found {
+					order = append(order, ks)
+				}
+			}
+		} else {
+			for _, it := range ms {
+				if ks, ok := it.Key.(string); ok {
+					order = append(order, ks)
+				}
+			}
+		}
+		if len(order) == 0 {
+			return "", false
+		}
+		kvIndent := si.itemKVIndent
+		if kvIndent == 0 {
+			kvIndent = si.indent + baseIndent
+		}
+		var sb strings.Builder
+		first := order[0]
+		fv, ok := vals[first]
+		if !ok {
+			return "", false
+		}
+		if si.firstKeyInline {
+			sb.WriteString(strings.Repeat(" ", si.indent))
+			sb.WriteString("- ")
+			sb.WriteString(first)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(fv))
+			sb.WriteString("\n")
+		} else {
+			sb.WriteString(strings.Repeat(" ", si.indent))
+			sb.WriteString("-\n")
+			sb.WriteString(strings.Repeat(" ", kvIndent))
+			sb.WriteString(first)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(fv))
+			sb.WriteString("\n")
+		}
+		for i := 1; i < len(order); i++ {
+			k := order[i]
+			v, ok := vals[k]
+			if !ok {
+				continue
+			}
+			sb.WriteString(strings.Repeat(" ", kvIndent))
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(v))
+			sb.WriteString("\n")
+		}
+		return sb.String(), true
+	}
+
+	shapeChanged := func(oldArr, newArr []interface{}) bool {
+		if len(oldArr) != len(newArr) {
+			return true
+		}
+		oldNames, ok1 := namesOf(oldArr)
+		newNames, ok2 := namesOf(newArr)
+		if !(ok1 && ok2) {
+			// conservative: if we cannot match items by stable identity, treat as shape change
+			return true
+		}
+		for i := range oldNames {
+			if oldNames[i] != newNames[i] {
+				return true
+			}
+		}
+		return false
+	}
+
+	var walk func(ms gyaml.MapSlice, path []string) bool
+	walk = func(ms gyaml.MapSlice, path []string) bool {
+		for _, it := range ms {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			switch v := it.Value.(type) {
+			case gyaml.MapSlice:
+				if !walk(v, append(path, k)) {
+					return false
+				}
+			case []interface{}:
+				origArr, ok := getArrAtPath(originalOrdered, path, k)
+				if !ok {
+					// no original anchor to replace against → cannot perform surgical block replace
+					continue
+				}
+				mpath := joinPath(append(path, k))
+				si := seqIdx[mpath]
+				if si == nil || !si.originalPath || !si.hasAnyItem || si.firstItemStart <= 0 || si.lastItemEnd <= 0 {
+					continue
+				}
+				if !shapeChanged(origArr, v) {
+					continue
+				}
+				// Build "pre-gap" map: next item's name -> gap bytes that preceded it
+				preGap := map[string][]byte{}
+				if len(si.items) >= 2 && len(si.gaps) == len(si.items)-1 {
+					for i := 0; i < len(si.items)-1; i++ {
+						nextName := si.items[i+1].name
+						if nextName == "" {
+							continue
+						}
+						g := si.gaps[i]
+						if len(g) > 0 {
+							preGap[nextName] = g
+						}
+					}
+				}
+				// Render new block
+				var sb strings.Builder
+				for _, el := range v {
+					msItem, ok := toMapSlice(el)
+					if !ok {
+						return false
+					}
+					if nm := getName(msItem); nm != "" {
+						if g, ok := preGap[nm]; ok && len(g) > 0 {
+							sb.Write(g)
+						}
+					}
+					txt, ok := renderItem(si, msItem)
+					if !ok {
+						return false
+					}
+					sb.WriteString(txt)
+				}
+				start := si.firstItemStart
+				end := si.lastItemEnd + 1 // include trailing newline
+				if start < 0 || end < start || end > len(original) {
+					return false
+				}
+				patches = append(patches, patch{start: start, end: end, data: []byte(sb.String())})
+				replaced[mpath] = struct{}{}
+			}
+		}
+		return true
+	}
+	if !walk(current, nil) {
+		return false, nil, nil
+	}
+	return true, patches, replaced
 }
 
 func buildInsertPatches(
@@ -3018,10 +3413,13 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 	case nil:
 		SetScalarNull(parent, last.key)
 	default:
-		// complex
+		// complex (map/array)
+		var oldChild *yaml.Node
 		found := false
 		for i := 0; i+1 < len(parent.Content); i += 2 {
 			if parent.Content[i].Kind == yaml.ScalarNode && parent.Content[i].Value == last.key {
+				// Remember previous value before we swap it out
+				oldChild = parent.Content[i+1]
 				parent.Content[i+1] = yval
 				found = true
 				break
@@ -3037,6 +3435,31 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			}
 			path := st.subPathByHN[parent]
 			st.ordered = setAnyAtPath(st.ordered, path, last.key, orderedVal)
+			// If we are replacing a sequence (array) value and its "shape" changed,
+			// force structured re-encode to avoid byte-surgical scrambling.
+			if yval.Kind == yaml.SequenceNode {
+				shapeChanged := true // default to conservative
+				if oldChild != nil && oldChild.Kind == yaml.SequenceNode {
+					// length change → definitely shape change
+					if len(oldChild.Content) == len(yval.Content) {
+						// Try to compare item identities by their "name" field (if present)
+						if oldNames, ok1 := seqItemNames(oldChild); ok1 {
+							if newNames, ok2 := seqItemNames(yval); ok2 {
+								shapeChanged = false
+								for i := range oldNames {
+									if oldNames[i] != newNames[i] {
+										shapeChanged = true
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+				if shapeChanged {
+					st.arraysDirty = true
+				}
+			}
 			st.mu.Unlock()
 		}
 	}
@@ -3356,4 +3779,32 @@ func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{})
 	}
 	res, _ := out.(gyaml.MapSlice)
 	return res, nil
+}
+
+// seqItemNames extracts the "name" scalar from each mapping item in a sequence.
+// Returns (names, true) only if every item is a mapping and has a string scalar "name".
+func seqItemNames(seq *yaml.Node) ([]string, bool) {
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return nil, false
+	}
+	out := make([]string, len(seq.Content))
+	for i, it := range seq.Content {
+		if it == nil || it.Kind != yaml.MappingNode {
+			return nil, false
+		}
+		found := false
+		for j := 0; j+1 < len(it.Content); j += 2 {
+			k := it.Content[j]
+			v := it.Content[j+1]
+			if k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode {
+				out[i] = v.Value
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return out, true
 }

@@ -2224,3 +2224,84 @@ func getMapKeys(m map[string]map[string]string) []string {
 	}
 	return keys
 }
+
+// TestArrayReplacePreservesInlineComments reproduces the failing comment preservation test
+// Checks if inline comments between array items are preserved when replacing array
+func TestArrayReplacePreservesInlineComments(t *testing.T) {
+	original := `# top comment
+java-service:
+  # external secrets comment
+  externalSecretEnvs:
+    - name: BAR
+      path: bar/path
+      property: BAR_PROP
+    # mid comment
+    - name: FOO
+      path: foo/path
+      property: FOO_PROP
+  otherField: untouched
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Simulate the operations:
+	// 1. Replace FOO/path with "foo/updated"
+	// 2. Add NEW
+	records := map[string]map[string]any{
+		"BAR": {"path": "bar/path", "property": "BAR_PROP"},
+		"FOO": {"path": "foo/updated", "property": "FOO_PROP"}, // REPLACED
+		"NEW": {"path": "new/path", "property": "NEW_PROP"},   // ADDED
+	}
+
+	order := extractArrayOrder(doc, []string{"java-service", "externalSecretEnvs"}, "name")
+	t.Logf("Original order: %v", order)
+
+	arrayJSON, err := buildArrayJSON(records, order, "name", []string{"path", "property"})
+	if err != nil {
+		t.Fatalf("buildArrayJSON: %v", err)
+	}
+	t.Logf("Built JSON: %s", string(arrayJSON))
+
+	if err := applySequencePatch(doc, []string{"java-service", "externalSecretEnvs"}, "replace", arrayJSON); err != nil {
+		t.Fatalf("applySequencePatch: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	t.Logf("Diff:\n%s", diff)
+	t.Logf("\n=== OUTPUT ===\n%s\n=== END ===", string(out))
+
+	updatedStr := string(out)
+
+	// Verify top-level comment is preserved
+	if !strings.Contains(updatedStr, "# top comment") {
+		t.Errorf("top-level comment lost:\n%s", updatedStr)
+	}
+
+	// Verify array leading comment is preserved
+	if !strings.Contains(updatedStr, "# external secrets comment") {
+		t.Errorf("array leading comment lost:\n%s", updatedStr)
+	}
+
+	// Verify inline array comment is preserved (THIS IS THE FAILING CHECK)
+	if !strings.Contains(updatedStr, "# mid comment") {
+		t.Errorf("inline array comment lost:\n%s", updatedStr)
+	}
+
+	// Verify unrelated field is untouched
+	if !strings.Contains(updatedStr, "otherField: untouched") {
+		t.Errorf("unrelated fields altered:\n%s", updatedStr)
+	}
+
+	// Verify new record was added
+	if !strings.Contains(updatedStr, "name: NEW") {
+		t.Errorf("new record not present:\n%s", updatedStr)
+	}
+}
