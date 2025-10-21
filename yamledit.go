@@ -41,9 +41,32 @@ type docState struct {
 	// Scalar value positions (original) keyed by path + key (we store all occurrences to handle dups)
 	valueOccByPathKey map[string][]valueOcc
 
+	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
+
 	// explicit deletions requested (path\0key)
 	toDelete    map[string]struct{}
 	arraysDirty bool // set only when JSON Patch mutates arrays (seq nodes)
+}
+
+// Information about a sequence under a mapping path in the original YAML.
+type seqInfo struct {
+	indent         int // spaces before '-' on the first line of an item
+	itemKVIndent   int // spaces for subsequent key lines inside an item
+	lastItemEnd    int // byte offset of the newline ending the last item's last line
+	hasAnyItem     bool
+	originalPath   bool
+	firstKeyInline bool     // whether first key appears on the same line as "- "
+	keyOrder       []string // preferred key order for items (captured from an existing item)
+}
+
+func cloneSeqIndex(in map[string]*seqInfo) map[string]*seqInfo {
+	out := make(map[string]*seqInfo, len(in))
+	for k, v := range in {
+		cp := *v
+		cp.keyOrder = append([]string(nil), v.keyOrder...)
+		out[k] = &cp
+	}
+	return out
 }
 
 // Information about a mapping block in the original YAML
@@ -145,6 +168,7 @@ func Parse(data []byte) (*yaml.Node, error) {
 		lineOffsets:       buildLineOffsets(data),
 		mapIndex:          map[string]*mapInfo{},
 		valueOccByPathKey: map[string][]valueOcc{},
+		seqIndex:          map[string]*seqInfo{},
 		toDelete:          map[string]struct{}{},
 	}
 
@@ -174,6 +198,117 @@ func Parse(data []byte) (*yaml.Node, error) {
 	return doc, nil
 }
 
+// indexSeqPositions indexes scalar positions for sequence items which are mapping nodes.
+func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return
+	}
+	for idx, it := range seq.Content {
+		if it == nil {
+			continue
+		}
+		if it.Kind == yaml.MappingNode {
+			for j := 0; j+1 < len(it.Content); j += 2 {
+				k := it.Content[j]
+				v := it.Content[j+1]
+				if k.Kind != yaml.ScalarNode || v.Kind != yaml.ScalarNode {
+					continue
+				}
+				valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
+				if valStart < 0 || valStart >= len(st.original) {
+					continue
+				}
+				valEnd := findScalarEndOnLine(st.original, valStart)
+				lineEnd := findLineEnd(st.original, valStart)
+				pk := makeSeqPathKey(cur, idx, k.Value)
+				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+					keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
+					valStart:     valStart,
+					valEnd:       valEnd,
+					lineEnd:      lineEnd,
+				})
+			}
+		}
+	}
+}
+
+// indexSequenceAnchors captures indent/style and insertion anchors for sequences.
+func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
+	mpath := joinPath(cur)
+	si := st.seqIndex[mpath]
+	if si == nil {
+		si = &seqInfo{originalPath: true}
+		st.seqIndex[mpath] = si
+	}
+	if len(seq.Content) == 0 {
+		si.hasAnyItem = false
+		return
+	}
+	si.hasAnyItem = true
+	lastIdx := len(seq.Content) - 1
+	item := seq.Content[lastIdx]
+	// Default lastItemEnd to the last scalar line in this item.
+	lastEnd := 0
+	if item.Kind == yaml.MappingNode {
+		// Derive indent and inline style from the first key line.
+		if len(item.Content) >= 2 {
+			firstK := item.Content[0]
+			ls := lineStartOffset(st.lineOffsets, firstK.Line)
+			le := findLineEnd(st.original, ls)
+			ln := st.original[ls:le]
+			si.indent = leadingSpaces(ln)
+			si.firstKeyInline = firstNonSpaceByte(ln) == '-'
+			// Compute kv indent (subsequent lines) as min leading spaces among key lines that
+			// are not on "- " lines; fallback to indent+base indent later.
+			kvIndent := 0
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				k := item.Content[j]
+				ks := lineStartOffset(st.lineOffsets, k.Line)
+				ke := findLineEnd(st.original, ks)
+				kl := st.original[ks:ke]
+				if firstNonSpaceByte(kl) == '-' {
+					continue
+				}
+				sp := leadingSpaces(kl)
+				if kvIndent == 0 || sp < kvIndent {
+					kvIndent = sp
+				}
+			}
+			if kvIndent == 0 {
+				// approximate; will be corrected at render if needed
+				kvIndent = si.indent + st.indent
+			}
+			si.itemKVIndent = kvIndent
+			// Key order from this item
+			order := make([]string, 0, len(item.Content)/2)
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				if item.Content[j].Kind == yaml.ScalarNode {
+					order = append(order, item.Content[j].Value)
+				}
+			}
+			si.keyOrder = order
+		}
+		for j := 0; j+1 < len(item.Content); j += 2 {
+			v := item.Content[j+1]
+			vs := offsetFor(st.lineOffsets, v.Line, v.Column)
+			if vs >= 0 && vs < len(st.original) {
+				le := findLineEnd(st.original, vs)
+				if le > lastEnd {
+					lastEnd = le
+				}
+			}
+		}
+	} else {
+		// Non-mapping item; anchor at its line end.
+		ls := lineStartOffset(st.lineOffsets, item.Line)
+		lastEnd = findLineEnd(st.original, ls)
+		si.indent = leadingSpaces(st.original[ls:lastEnd])
+		si.itemKVIndent = 0
+		si.firstKeyInline = true
+	}
+	si.lastItemEnd = lastEnd
+}
+
 // Marshal encodes the YAML. Prefer byte-surgical patching when safe; otherwise fall back.
 func Marshal(doc *yaml.Node) ([]byte, error) {
 	st, ok := lookup(doc)
@@ -197,6 +332,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
 	origOrdered := cloneMapSlice(st.origOrdered)
 	delSet := make(map[string]struct{}, len(st.toDelete))
+	seqIdx := cloneSeqIndex(st.seqIndex)
 	for k := range st.toDelete {
 		delSet[k] = struct{}{}
 	}
@@ -221,7 +357,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		return buf.Bytes(), nil
 	}
 	// Attempt byte-surgical patching first
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, indent, delSet)
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, delSet)
 	if okPatch {
 		return out, nil
 	}
@@ -980,16 +1116,12 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 				mi.lastLineEnd = childMi.lastLineEnd
 			}
 		} else if v.Kind == yaml.SequenceNode {
-			// Recurse into sequence items; index mapping items with a synthetic index segment
-			for idx, item := range v.Content {
-				if item.Kind == yaml.MappingNode {
-					childPath := append(append([]string{}, cur...), key, indexSeg(idx))
-					indexPositions(st, item, childPath)
-					if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > mi.lastLineEnd {
-						mi.lastLineEnd = childMi.lastLineEnd
-					}
-				}
-			}
+			seqPath := append(cur, key)
+			// Index scalars inside sequence items (if they are mappings).
+			indexSeqPositions(st, v, seqPath)
+			// Capture anchors/indent for append surgery.
+			indexSequenceAnchors(st, v, seqPath)
+			// Note: we do not modify mapIndex.lastLineEnd for sequences.
 		}
 	}
 }
@@ -1012,6 +1144,7 @@ func marshalBySurgery(
 	originalOrdered gyaml.MapSlice,
 	mapIdx map[string]*mapInfo,
 	valIdx map[string][]valueOcc,
+	seqIdx map[string]*seqInfo,
 	baseIndent int,
 	deletions map[string]struct{},
 ) ([]byte, bool) {
@@ -1061,6 +1194,17 @@ func marshalBySurgery(
 			return nil, false
 		}
 		for _, p := range insertPatches {
+			p.seq = seq
+			seq++
+			patches = append(patches, p)
+		}
+
+		// 3b) Append NEW items to sequences (arrays) at the end (safe styles only).
+		seqOK, seqPatches := buildSeqAppendPatches(original, current, originalOrdered, seqIdx, baseIndent)
+		if !seqOK {
+			return nil, false
+		}
+		for _, p := range seqPatches {
 			p.seq = seq
 			seq++
 			patches = append(patches, p)
@@ -1153,6 +1297,229 @@ func toPlain(v interface{}) interface{} {
 		return t
 	}
 }
+
+// Build patches for appending new items to sequences (arrays) at the end.
+func buildSeqAppendPatches(
+	original []byte,
+	current gyaml.MapSlice,
+	originalOrdered gyaml.MapSlice,
+	seqIdx map[string]*seqInfo,
+	baseIndent int,
+) (bool, []patch) {
+	var patches []patch
+
+	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
+	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
+		// navigate to mapping at path
+		cur := ms
+		for _, seg := range path {
+			found := false
+			for _, it := range cur {
+				ks, ok := it.Key.(string)
+				if ok && ks == seg {
+					if sub, ok2 := it.Value.(gyaml.MapSlice); ok2 {
+						cur = sub
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		}
+		for _, it := range cur {
+			ks, ok := it.Key.(string)
+			if ok && ks == key {
+				if arr, ok2 := it.Value.([]interface{}); ok2 {
+					return arr, true
+				}
+				return nil, false
+			}
+		}
+		return nil, false
+	}
+
+	var toMapSlice = func(v interface{}) (gyaml.MapSlice, bool) {
+		switch t := v.(type) {
+		case gyaml.MapSlice:
+			return t, true
+		case map[string]interface{}:
+			ms := gyaml.MapSlice{}
+			for k, vv := range t {
+				ms = append(ms, gyaml.MapItem{Key: k, Value: jsonValueToOrdered(vv)})
+			}
+			return ms, true
+		default:
+			return gyaml.MapSlice{}, false
+		}
+	}
+
+	renderScalar := func(v interface{}) string {
+		switch vv := v.(type) {
+		case int:
+			return fmt.Sprintf("%d", vv)
+		case float64:
+			return strconv.FormatFloat(vv, 'g', -1, 64)
+		case bool:
+			if vv {
+				return "true"
+			}
+			return "false"
+		case string:
+			if isSafeBareString(vv) {
+				return vv
+			}
+			return quoteNewStringToken(vv)
+		case nil:
+			return "null"
+		default:
+			s := fmt.Sprint(vv)
+			if isSafeBareString(s) {
+				return s
+			}
+			return quoteNewStringToken(s)
+		}
+	}
+
+	renderItem := func(si *seqInfo, ms gyaml.MapSlice) (string, bool) {
+		// Build lookup and order
+		vals := map[string]interface{}{}
+		for _, it := range ms {
+			if ks, ok := it.Key.(string); ok {
+				vals[ks] = it.Value
+			}
+		}
+		order := []string{}
+		if len(si.keyOrder) > 0 {
+			order = append(order, si.keyOrder...)
+			for _, it := range ms {
+				ks, _ := it.Key.(string)
+				found := false
+				for _, k := range order {
+					if k == ks {
+						found = true
+						break
+					}
+				}
+				if !found {
+					order = append(order, ks)
+				}
+			}
+		} else {
+			for _, it := range ms {
+				if ks, ok := it.Key.(string); ok {
+					order = append(order, ks)
+				}
+			}
+		}
+		if len(order) == 0 {
+			return "", false
+		}
+		kvIndent := si.itemKVIndent
+		if kvIndent == 0 {
+			kvIndent = si.indent + baseIndent
+		}
+		var sb strings.Builder
+		first := order[0]
+		fv, ok := vals[first]
+		if !ok {
+			return "", false
+		}
+		if si.firstKeyInline {
+			sb.WriteString(strings.Repeat(" ", si.indent))
+			sb.WriteString("- ")
+			sb.WriteString(first)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(fv))
+			sb.WriteString("\n")
+		} else {
+			sb.WriteString(strings.Repeat(" ", si.indent))
+			sb.WriteString("-\n")
+			sb.WriteString(strings.Repeat(" ", kvIndent))
+			sb.WriteString(first)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(fv))
+			sb.WriteString("\n")
+		}
+		for i := 1; i < len(order); i++ {
+			k := order[i]
+			v, ok := vals[k]
+			if !ok {
+				continue
+			}
+			sb.WriteString(strings.Repeat(" ", kvIndent))
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			sb.WriteString(renderScalar(v))
+			sb.WriteString("\n")
+		}
+		return sb.String(), true
+	}
+
+	var walk func(ms gyaml.MapSlice, path []string) bool
+	walk = func(ms gyaml.MapSlice, path []string) bool {
+		for _, it := range ms {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			switch v := it.Value.(type) {
+			case gyaml.MapSlice:
+				if !walk(v, append(path, k)) {
+					return false
+				}
+			case []interface{}:
+				origArr, ok := getArrAtPath(originalOrdered, path, k)
+				if !ok {
+					return false
+				}
+				olen, nlen := len(origArr), len(v)
+				if nlen < olen {
+					return false
+				} // deletions not handled surgically
+				if nlen == olen {
+					continue
+				} // nothing appended
+				// Only handle pure append at end.
+				mpath := joinPath(append(path, k))
+				si := seqIdx[mpath]
+				if si == nil || !si.originalPath || !si.hasAnyItem {
+					return false
+				}
+				insertPos := si.lastItemEnd + 1
+				if insertPos < 0 || insertPos > len(original) {
+					return false
+				}
+				var sb strings.Builder
+				// If last item line had no newline at EOF, start with newline.
+				if si.lastItemEnd >= len(original) || (si.lastItemEnd < len(original) && original[si.lastItemEnd] != '\n') {
+					sb.WriteString("\n")
+				}
+				for i := olen; i < nlen; i++ {
+					msItem, ok := toMapSlice(v[i])
+					if !ok {
+						return false
+					}
+					txt, ok := renderItem(si, msItem)
+					if !ok {
+						return false
+					}
+					sb.WriteString(txt)
+					// advance anchor for chaining multiple appends in same sequence
+					si.lastItemEnd = insertPos + len(sb.String()) - 1
+				}
+				patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(sb.String())})
+			}
+		}
+		return true
+	}
+	if !walk(current, nil) {
+		return false, nil
+	}
+	return true, patches
+}
+
 func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc) (bool, []patch) {
 	var patches []patch
 
@@ -1821,12 +2188,31 @@ func gcd(a, b int) int {
 	return a
 }
 
+// makeSeqPathKey builds the index for a scalar key inside a mapping item located at a sequence under 'path'.
+// The segment for the index is encoded as "[<idx>]" to avoid collisions with real keys.
+func makeSeqPathKey(path []string, idx int, key string) string {
+	segs := make([]string, 0, len(path)+2)
+	segs = append(segs, path...)
+	segs = append(segs, fmt.Sprintf("[%d]", idx))
+	segs = append(segs, key)
+	return strings.Join(segs, pathSep)
+}
+
 func leadingSpaces(line []byte) int {
 	i := 0
 	for i < len(line) && line[i] == ' ' {
 		i++
 	}
 	return i
+}
+
+func firstNonSpaceByte(line []byte) byte {
+	for _, b := range line {
+		if b != ' ' && b != '\t' {
+			return b
+		}
+	}
+	return 0
 }
 
 // --------------------------------------------------------------------------------------
@@ -2380,7 +2766,7 @@ func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) erro
 	return nil
 }
 
-func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []string, tokens []ptrToken, raw json.RawMessage) error {
+func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, tokens []ptrToken, raw json.RawMessage) error {
 	if len(tokens) == 0 {
 		return errors.New("yamledit: add: empty path not supported")
 	}
@@ -2402,7 +2788,17 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []stri
 			return errors.New("yamledit: add: parent is not an array")
 		}
 		if last.append {
+			// Append to end: update AST and ordered view
 			parent.Content = append(parent.Content, yval)
+			if st != nil {
+				st.mu.Lock()
+				absTokens := appendPathTokens(basePath, tokens)
+				// Append in ordered view
+				st.ordered, _ = orderedAddArray(st.ordered, absTokens, orderedVal, true)
+				// rely on surgical append in Marshal
+				st.mu.Unlock()
+			}
+			return nil
 		} else {
 			if last.index < 0 || last.index > len(parent.Content) {
 				return fmt.Errorf("yamledit: add: index %d out of bounds", last.index)
@@ -2411,14 +2807,6 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []stri
 			copy(parent.Content[last.index+1:], parent.Content[last.index:])
 			parent.Content[last.index] = yval
 		}
-		if st != nil {
-			st.mu.Lock()
-			absTokens := appendPathTokens(baseFromRoot, tokens)
-			st.ordered, _ = orderedAddArray(st.ordered, absTokens, orderedVal, last.append)
-			st.arraysDirty = true
-			st.mu.Unlock()
-		}
-		return nil
 	}
 
 	// mapping

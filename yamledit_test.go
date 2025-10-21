@@ -1616,3 +1616,48 @@ func TestJSONPatch_ConcurrentMarshalNoDeadlock(t *testing.T) {
 	}
 	<-done
 }
+
+func TestApplyJSONPatchArrayAddMinimalDiff(t *testing.T) {
+	original := `service:
+  envs:
+    FEATURE_FLAG: 'true'
+    SERVICE_URL: "https://example.internal/"
+  externalSecretEnvs:
+    - name: PRIMARY_PASSWORD
+      path: data/apps/prod/service
+      property: primary-password
+    - name: CACHE_PASSWORD
+      path: data/apps/prod/service
+      property: cache-password
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	patch := mustDecodePatch(t, `[
+{"op":"add","path":"/-","value":{"name":"EXTRA_SECRET","path":"data/shared/prod","property":"extra"}}
+]`)
+
+	if err := ApplyJSONPatchAtPath(doc, patch, []string{"service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPath: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	diff := unifiedDiff(original, string(out))
+	adds, removes := diffStats(diff)
+	if adds > 3 || removes > 3 {
+		t.Fatalf("expected localized change, got %d additions / %d removals:\n%s", adds, removes, diff)
+	}
+	if !strings.Contains(string(out), "name: EXTRA_SECRET") {
+		t.Fatalf("new secret missing:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "SERVICE_URL: \"https://example.internal/\"") {
+		t.Fatalf("env block modified:\n%s", string(out))
+	}
+}
