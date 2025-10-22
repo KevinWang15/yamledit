@@ -66,6 +66,9 @@ type seqInfo struct {
 	keyOrder       []string      // preferred key order for items (captured from an existing item)
 	items          []seqItemInfo // per-item positions and names
 	gaps           [][]byte      // raw bytes between items; len = len(items)-1
+	// header (key line) anchors for the sequence value (e.g., "externalSecretEnvs:")
+	headerLineStart int // start offset of the key's line ("externalSecretEnvs:")
+	headerLineEnd   int // end offset of that line (newline position)
 }
 
 func cloneSeqIndex(in map[string]*seqInfo) map[string]*seqInfo {
@@ -269,12 +272,17 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 }
 
 // indexSequenceAnchors captures indent/style and insertion anchors for sequences.
-func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
+func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string, keyNode *yaml.Node) {
 	mpath := joinPath(cur)
 	si := st.seqIndex[mpath]
 	if si == nil {
 		si = &seqInfo{originalPath: true}
 		st.seqIndex[mpath] = si
+	}
+	// Capture the header line for the mapping key that owns this sequence
+	if keyNode != nil {
+		si.headerLineStart = lineStartOffset(st.lineOffsets, keyNode.Line)
+		si.headerLineEnd = findLineEnd(st.original, si.headerLineStart)
 	}
 	if len(seq.Content) == 0 {
 		si.hasAnyItem = false
@@ -1195,7 +1203,7 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			// Index scalars inside sequence items (if they are mappings).
 			indexSeqPositions(st, v, seqPath)
 			// Capture anchors/indent for append surgery.
-			indexSequenceAnchors(st, v, seqPath)
+			indexSequenceAnchors(st, v, seqPath, k)
 			// Note: we do not modify mapIndex.lastLineEnd for sequences.
 		}
 	}
@@ -2340,6 +2348,36 @@ func buildInsertPatches(
 							return quoteNewStringToken(s)
 						}
 					}
+					// Helper: stable order — prefer name, then path, property, then others lexicographically.
+					orderKeys := func(ms gyaml.MapSlice) []string {
+						pref := []string{"name", "path", "property"}
+						have := map[string]bool{}
+						for _, p := range pref {
+							have[p] = false
+						}
+						keys := []string{}
+						// collect presence
+						seen := map[string]bool{}
+						for _, it := range ms {
+							if ks, ok := it.Key.(string); ok {
+								seen[ks] = true
+							}
+						}
+						for _, p := range pref {
+							if seen[p] {
+								keys = append(keys, p)
+								have[p] = true
+							}
+						}
+						rest := []string{}
+						for _, it := range ms {
+							if ks, ok := it.Key.(string); ok && !have[ks] {
+								rest = append(rest, ks)
+							}
+						}
+						sort.Strings(rest)
+						return append(keys, rest...)
+					}
 					// Render the new sequence block.
 					if len(v) == 0 {
 						// Empty array → single line key: []
@@ -2358,37 +2396,83 @@ func buildInsertPatches(
 						for _, el := range v {
 							switch ev := el.(type) {
 							case gyaml.MapSlice:
-								// Render mapping item in non-inline style:
-								//   -\n
-								//     key: value
-								sb.WriteString(strings.Repeat(" ", itemIndent))
-								sb.WriteString("-\n")
-								kvIndent := itemIndent + baseIndent
+								// Render IN INLINE style: "- name: …" on first line, then other keys.
+								// Choose first key = "name" if present; else use stable ordered first.
+								keys := orderKeys(ev)
+								if len(keys) == 0 {
+									continue
+								}
+								first := keys[0]
+								var firstVal interface{}
 								for _, kv := range ev {
-									ks, _ := kv.Key.(string)
+									if ks, _ := kv.Key.(string); ks == first {
+										firstVal = kv.Value
+										break
+									}
+								}
+								sb.WriteString(strings.Repeat(" ", itemIndent))
+								sb.WriteString("- ")
+								sb.WriteString(first)
+								sb.WriteString(": ")
+								sb.WriteString(renderScalar(firstVal))
+								sb.WriteString("\n")
+								kvIndent := itemIndent + baseIndent
+								for _, k2 := range keys[1:] {
+									// find value
+									var v2 interface{}
+									for _, kv := range ev {
+										if ks, _ := kv.Key.(string); ks == k2 {
+											v2 = kv.Value
+											break
+										}
+									}
 									sb.WriteString(strings.Repeat(" ", kvIndent))
-									sb.WriteString(ks)
+									sb.WriteString(k2)
 									sb.WriteString(": ")
-									sb.WriteString(renderScalar(kv.Value))
+									sb.WriteString(renderScalar(v2))
 									sb.WriteString("\n")
 								}
+
 							case map[string]interface{}:
 								// Convert to ordered MapSlice for stable rendering
+
 								ms := gyaml.MapSlice{}
 								for kk, vv := range ev {
 									ms = append(ms, gyaml.MapItem{Key: kk, Value: vv})
 								}
-								sb.WriteString(strings.Repeat(" ", itemIndent))
-								sb.WriteString("-\n")
-								kvIndent := itemIndent + baseIndent
+								keys := orderKeys(ms)
+								if len(keys) == 0 {
+									continue
+								}
+								var firstVal interface{}
 								for _, kv := range ms {
-									ks, _ := kv.Key.(string)
+									if ks, _ := kv.Key.(string); ks == keys[0] {
+										firstVal = kv.Value
+										break
+									}
+								}
+								sb.WriteString(strings.Repeat(" ", itemIndent))
+								sb.WriteString("- ")
+								sb.WriteString(keys[0])
+								sb.WriteString(": ")
+								sb.WriteString(renderScalar(firstVal))
+								sb.WriteString("\n")
+								kvIndent := itemIndent + baseIndent
+								for _, k2 := range keys[1:] {
+									var v2 interface{}
+									for _, kv := range ms {
+										if ks, _ := kv.Key.(string); ks == k2 {
+											v2 = kv.Value
+											break
+										}
+									}
 									sb.WriteString(strings.Repeat(" ", kvIndent))
-									sb.WriteString(ks)
+									sb.WriteString(k2)
 									sb.WriteString(": ")
-									sb.WriteString(renderScalar(kv.Value))
+									sb.WriteString(renderScalar(v2))
 									sb.WriteString("\n")
 								}
+
 							default:
 								// Scalar item
 								sb.WriteString(strings.Repeat(" ", itemIndent))
@@ -2562,9 +2646,34 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx
 	for pk := range deletions {
 		occs := valIdx[pk]
 		if len(occs) == 0 {
-			// Key didn’t exist in original as a scalar line → no surgical deletion to make.
-			// Not an error: fallback encoder will already have removed from the logical map.
+			// No scalar line for this key. It might be a sequence or mapping value.
+			// If it is a sequence we indexed, delete the whole block (header + items).
+			// pk has the form "a\0b\0...<key>"
+			parts := strings.Split(pk, pathSep)
+			if len(parts) >= 1 {
+				seqPath := joinPath(parts) // joinPath copies; we actually need the full path, not just parent
+				// For sequences we indexed them with the full mapping path (parent + key).
+				if si, ok := globalSeqLookupForDeletion(seqPath); ok {
+					start := si.headerLineStart
+					end := si.headerLineEnd
+					if si.hasAnyItem && si.lastItemEnd >= end {
+						end = si.lastItemEnd
+					}
+					// delete the newline after end if present
+					if end < len(original) && original[end] == '\n' {
+						end++
+					} else {
+						end++ // safe: Apply will clamp
+					}
+					if start >= 0 && end >= start && end <= len(original) {
+						patches = append(patches, patch{start: start, end: end, data: []byte{}})
+					}
+					continue
+				}
+			}
+			// Otherwise: no surgical deletion for this key; fallback will handle it.
 			continue
+
 		}
 		for _, o := range occs {
 			start := o.keyLineStart
@@ -2576,6 +2685,26 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx
 		}
 	}
 	return true, patches
+}
+
+// globalSeqLookupForDeletion provides access to seqIndex for deletion,
+// by probing the registered docStates. We do not hold regMu while reading per-state maps.
+func globalSeqLookupForDeletion(path string) (*seqInfo, bool) {
+	regMu.Lock()
+	states := make([]*docState, 0, len(reg))
+	for _, s := range reg {
+		states = append(states, s)
+	}
+	regMu.Unlock()
+	for _, s := range states {
+		s.mu.RLock()
+		if si, ok := s.seqIndex[path]; ok && si != nil && si.originalPath {
+			s.mu.RUnlock()
+			return si, true
+		}
+		s.mu.RUnlock()
+	}
+	return nil, false
 }
 
 // ----- Small utilities for indices and scanning -----

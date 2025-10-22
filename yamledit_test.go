@@ -2634,3 +2634,181 @@ func TestCreateArrayThenAddItemPreservesQuotes(t *testing.T) {
 		t.Errorf("Expected MY_SECRET to be added")
 	}
 }
+
+// TestArrayItemFormatting_DashOnSameLineAsFirstField verifies that when yamledit
+// creates new array items via JSON patch, the dash "-" is on the same line as the
+// first field, not on a separate line. This is the standard YAML formatting style.
+//
+// Expected format:
+//
+//   - name: VALUE
+//     path: VALUE
+//
+// NOT:
+//
+//	-
+//	  name: VALUE
+//	  path: VALUE
+func TestArrayItemFormatting_DashOnSameLineAsFirstField(t *testing.T) {
+	// Initial YAML WITHOUT array (will be added fresh)
+	original := `java-service:
+  periodSeconds: 3
+  port: 8080
+  successThreshold: 1
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Apply a JSON patch to create an array with one item using ApplyJSONPatchAtPathBytes
+	// This mimics how the accessor creates arrays
+	arrayJSON := []byte(`[{"name":"A","path":"A","property":"A"}]`)
+	patchOp := []struct {
+		Op    string          `json:"op"`
+		Path  string          `json:"path"`
+		Value json.RawMessage `json:"value,omitempty"`
+	}{
+		{Op: "add", Path: "", Value: json.RawMessage(arrayJSON)},
+	}
+	patchBytes, err := json.Marshal(patchOp)
+	if err != nil {
+		t.Fatalf("Marshal patch: %v", err)
+	}
+
+	// Ensure parent path exists
+	EnsurePath(doc, "java-service")
+
+	// Apply the patch at the array path (will create the field)
+	if err := ApplyJSONPatchAtPathBytes(doc, patchBytes, []string{"java-service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	updatedStr := string(out)
+	t.Logf("Updated YAML:\n%s", updatedStr)
+
+	// Check that the array item uses inline format (dash on same line as first field)
+	lines := strings.Split(updatedStr, "\n")
+
+	var foundArrayStart bool
+	var foundBadFormatting bool
+	var dashLineIdx int
+
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "-" {
+			// Found a standalone dash - this is bad formatting
+			foundBadFormatting = true
+			dashLineIdx = i
+			t.Logf("Found standalone dash at line %d: %q", i+1, line)
+		}
+		if strings.Contains(line, "- name: A") {
+			foundArrayStart = true
+			t.Logf("Found correct inline format at line %d: %q", i+1, line)
+		}
+	}
+
+	if foundBadFormatting {
+		t.Errorf("YAML array item has dash on separate line (bad formatting)")
+		t.Errorf("Line %d: %q", dashLineIdx+1, lines[dashLineIdx])
+		if dashLineIdx+1 < len(lines) {
+			t.Errorf("Line %d: %q", dashLineIdx+2, lines[dashLineIdx+1])
+		}
+		t.Errorf("Expected format: '  - name: A' (dash and field on same line)")
+		t.Errorf("Got format: '  -' followed by '    name: A' (dash on separate line)")
+	}
+
+	if !foundArrayStart && !foundBadFormatting {
+		t.Errorf("Could not find array item for 'A' in output YAML")
+		t.Errorf("Full YAML:\n%s", updatedStr)
+	}
+
+	if !foundBadFormatting && foundArrayStart {
+		t.Logf("✓ Array formatting is correct (dash on same line as first field)")
+	}
+}
+
+// TestArrayDeletion_RemovesAllLines verifies that when deleting an array field
+// using DeleteKey, ALL lines of the array are removed, not just some.
+//
+// This reproduces a bug where deleting array fields leaves orphaned lines:
+//   - The array field key and first item's dash may be deleted
+//   - But subsequent field lines (path:, property:) remain as orphaned content
+//
+// Expected: All array content should be removed
+// Bug: Only partial deletion, leaving malformed YAML
+func TestArrayDeletion_RemovesAllLines(t *testing.T) {
+	// Initial YAML WITH an array containing multiple items
+	original := `java-service:
+  periodSeconds: 3
+  port: 8080
+  successThreshold: 1
+  externalSecretEnvs:
+    - name: POSTGRES_10_PASSWD
+      path: applications/data/myapp/staging/us
+      property: POSTGRES_PASSWORD
+    - name: POSTGRES_RO_PASSWORD
+      path: applications/data/myapp/staging/us
+      property: POSTGRES_RO_PASSWORD
+  otherField: value
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Navigate to java-service node and delete the externalSecretEnvs field
+	javaServiceNode := EnsurePath(doc, "java-service")
+	DeleteKey(javaServiceNode, "externalSecretEnvs")
+
+	// Marshal back to YAML
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	outputStr := string(out)
+	t.Logf("Output YAML after deletion:\n%s", outputStr)
+
+	// Check that externalSecretEnvs is completely gone
+	if strings.Contains(outputStr, "externalSecretEnvs") {
+		t.Errorf("Field 'externalSecretEnvs' should be completely deleted, but still appears in output")
+	}
+
+	// Check that NO orphaned array content remains
+	lines := strings.Split(outputStr, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+
+		// These should NOT appear (they were part of the deleted array)
+		if strings.Contains(trimmed, "name: POSTGRES_10_PASSWD") {
+			t.Errorf("Line %d: Found orphaned 'name: POSTGRES_10_PASSWD' after deleting externalSecretEnvs: %q", i+1, line)
+		}
+		if strings.Contains(trimmed, "name: POSTGRES_RO_PASSWORD") {
+			t.Errorf("Line %d: Found orphaned 'name: POSTGRES_RO_PASSWORD' after deleting externalSecretEnvs: %q", i+1, line)
+		}
+		if strings.Contains(trimmed, "path: applications/data/") {
+			t.Errorf("Line %d: Found orphaned 'path:' field after deleting externalSecretEnvs: %q", i+1, line)
+		}
+		if strings.Contains(trimmed, "property: POSTGRES_") {
+			t.Errorf("Line %d: Found orphaned 'property:' field after deleting externalSecretEnvs: %q", i+1, line)
+		}
+	}
+
+	// Verify other fields are preserved
+	if !strings.Contains(outputStr, "periodSeconds: 3") {
+		t.Errorf("Expected 'periodSeconds: 3' to be preserved")
+	}
+	if !strings.Contains(outputStr, "otherField: value") {
+		t.Errorf("Expected 'otherField: value' to be preserved")
+	}
+
+	t.Logf("✓ Array deletion test complete")
+}
