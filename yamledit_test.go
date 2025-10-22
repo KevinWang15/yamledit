@@ -2415,3 +2415,222 @@ func TestScalarToMapping_FallbackMinimalChurn(t *testing.T) {
 		t.Fatalf("expected at least one add and one removal due to shape change; got +%d/-%d\n%s", adds, removes, diff)
 	}
 }
+
+// TestArrayReplacePreservesDoubleQuotedUnrelatedFields tests that replacing an array
+// does not remove double quotes from unrelated string fields in sibling mappings.
+// This reproduces a bug where instrumentation.instanceOverride: "value" loses its quotes
+// when externalSecretEnvs array is replaced.
+func TestArrayReplacePreservesDoubleQuotedUnrelatedFields(t *testing.T) {
+	original := `java-service:
+  cpu: 800
+  memory: 4096
+  kafkaSslTrustStore: true
+  useKafkaCredentials: true
+  instrumentation:
+    instanceOverride: "my-instrumentation-1-32-0"
+  externalSecretEnvs:
+    - name: EXISTING_SECRET
+      path: secret/existing
+      property: EXISTING_PROP
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Add a new secret to the externalSecretEnvs array
+	records := map[string]map[string]any{
+		"EXISTING_SECRET": {"path": "secret/existing", "property": "EXISTING_PROP"},
+		"NEW_SECRET":      {"path": "secret/new", "property": "NEW_PROP"},
+	}
+
+	order := extractArrayOrder(doc, []string{"java-service", "externalSecretEnvs"}, "name")
+	arrayJSON, err := buildArrayJSON(records, order, "name", []string{"path", "property"})
+	if err != nil {
+		t.Fatalf("buildArrayJSON: %v", err)
+	}
+
+	if err := applySequencePatch(doc, []string{"java-service", "externalSecretEnvs"}, "replace", arrayJSON); err != nil {
+		t.Fatalf("applySequencePatch: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	updatedStr := string(out)
+	t.Logf("Updated YAML:\n%s", updatedStr)
+
+	// The critical check: instrumentation.instanceOverride should still be double-quoted
+	instanceOverrideLine := getLineContaining(updatedStr, "instanceOverride:")
+	t.Logf("instanceOverride line: %q", instanceOverrideLine)
+
+	if !strings.Contains(instanceOverrideLine, `"my-instrumentation-1-32-0"`) {
+		t.Errorf("Expected instanceOverride to remain double-quoted as \"my-instrumentation-1-32-0\", but got: %q", instanceOverrideLine)
+		t.Errorf("Full updated YAML:\n%s", updatedStr)
+	}
+
+	// Verify the array change was applied
+	if !strings.Contains(updatedStr, "name: NEW_SECRET") {
+		t.Errorf("Expected NEW_SECRET to be added")
+	}
+
+	// Verify other unrelated fields are unchanged
+	if !strings.Contains(updatedStr, "cpu: 800") {
+		t.Errorf("cpu field changed unexpectedly")
+	}
+	if !strings.Contains(updatedStr, "kafkaSslTrustStore: true") {
+		t.Errorf("kafkaSslTrustStore field changed unexpectedly")
+	}
+}
+
+// TestParseMarshalPreservesDoubleQuotedStrings is a minimal test that just parses
+// and marshals without any changes. This tests if yamledit preserves double quotes
+// during a basic parse/marshal cycle.
+func TestParseMarshalPreservesDoubleQuotedStrings(t *testing.T) {
+	original := `java-service:
+  cpu: 800
+  memory: 4096
+  instrumentation:
+    instanceOverride: "my-instrumentation-1-32-0"
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	updatedStr := string(out)
+	t.Logf("After Parse/Marshal:\n%s", updatedStr)
+
+	// Check if double quotes are preserved on the instanceOverride field
+	instanceOverrideLine := getLineContaining(updatedStr, "instanceOverride:")
+	t.Logf("instanceOverride line: %q", instanceOverrideLine)
+
+	if !strings.Contains(instanceOverrideLine, `"my-instrumentation-1-32-0"`) {
+		t.Errorf("Expected instanceOverride to remain double-quoted as \"my-instrumentation-1-32-0\", but got: %q", instanceOverrideLine)
+		t.Errorf("Full YAML after parse/marshal:\n%s", updatedStr)
+	}
+}
+
+// TestApplyJSONPatchAtPathBytesPreservesDoubleQuotes tests if ApplyJSONPatchAtPathBytes
+// preserves double quotes in unrelated fields when applying a patch to an array.
+func TestApplyJSONPatchAtPathBytesPreservesDoubleQuotes(t *testing.T) {
+	original := `java-service:
+  cpu: 800
+  memory: 4096
+  instrumentation:
+    instanceOverride: "my-instrumentation-1-32-0"
+  externalSecretEnvs:
+    - name: EXISTING_SECRET
+      path: secret/existing
+      property: EXISTING_PROP
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Apply a JSON patch to replace the entire array
+	patch := []byte(`[
+		{
+			"op":"replace",
+			"path":"",
+			"value":[
+				{"name":"EXISTING_SECRET","path":"secret/existing","property":"EXISTING_PROP"},
+				{"name":"NEW_SECRET","path":"secret/new","property":"NEW_PROP"}
+			]
+		}
+	]`)
+
+	if err := ApplyJSONPatchAtPathBytes(doc, patch, []string{"java-service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	updatedStr := string(out)
+	t.Logf("After applying patch:\n%s", updatedStr)
+
+	// The critical check: instrumentation.instanceOverride should still be double-quoted
+	instanceOverrideLine := getLineContaining(updatedStr, "instanceOverride:")
+	t.Logf("instanceOverride line: %q", instanceOverrideLine)
+
+	if !strings.Contains(instanceOverrideLine, `"my-instrumentation-1-32-0"`) {
+		t.Errorf("Expected instanceOverride to remain double-quoted as \"my-instrumentation-1-32-0\", but got: %q", instanceOverrideLine)
+		t.Errorf("Full updated YAML:\n%s", updatedStr)
+	}
+
+	// Verify the patch was applied
+	if !strings.Contains(updatedStr, "name: NEW_SECRET") {
+		t.Errorf("Expected NEW_SECRET to be added")
+	}
+}
+
+// TestCreateArrayThenAddItemPreservesQuotes mimics the exact flow of the accessor:
+// 1. Start with YAML that has no externalSecretEnvs array
+// 2. Create an empty array
+// 3. Add an item to the array
+// This should preserve quotes in unrelated fields.
+func TestCreateArrayThenAddItemPreservesQuotes(t *testing.T) {
+	original := `java-service:
+  cpu: 800
+  memory: 4096
+  instrumentation:
+    instanceOverride: "my-instrumentation-1-32-0"
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Step 1: Create empty array (like the accessor does)
+	parentNode := EnsurePath(doc, "java-service")
+	emptyArrayPatch := []byte(`[{"op":"add","path":"/externalSecretEnvs","value":[]}]`)
+	if err := ApplyJSONPatchBytes(parentNode, emptyArrayPatch); err != nil {
+		t.Fatalf("Create empty array: %v", err)
+	}
+
+	// Step 2: Add an item to the array
+	addItemPatch := []byte(`[{"op":"add","path":"/-","value":{"name":"MY_SECRET","path":"secret/path","property":"MY_PROPERTY"}}]`)
+	if err := ApplyJSONPatchAtPathBytes(doc, addItemPatch, []string{"java-service", "externalSecretEnvs"}); err != nil {
+		t.Fatalf("Add item: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	updatedStr := string(out)
+	t.Logf("After creating array and adding item:\n%s", updatedStr)
+
+	// The critical check: instrumentation.instanceOverride should still be double-quoted
+	instanceOverrideLine := getLineContaining(updatedStr, "instanceOverride:")
+	t.Logf("instanceOverride line: %q", instanceOverrideLine)
+
+	if !strings.Contains(instanceOverrideLine, `"my-instrumentation-1-32-0"`) {
+		t.Errorf("Expected instanceOverride to remain double-quoted as \"my-instrumentation-1-32-0\", but got: %q", instanceOverrideLine)
+		t.Errorf("Full updated YAML:\n%s", updatedStr)
+	}
+
+	// Verify the array was created and item was added
+	if !strings.Contains(updatedStr, "externalSecretEnvs:") {
+		t.Errorf("Expected externalSecretEnvs array to be created")
+	}
+	if !strings.Contains(updatedStr, "name: MY_SECRET") {
+		t.Errorf("Expected MY_SECRET to be added")
+	}
+}
