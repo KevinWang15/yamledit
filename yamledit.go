@@ -521,9 +521,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 
 	st.mu.RLock()
 	ordered := cloneMapSlice(st.ordered) // snapshot
-	comments := st.comments
 	indent := st.indent
-	indentSeq := st.indentSeq
 	original := st.original
 	mapIdx := cloneMapIndex(st.mapIndex)
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
@@ -551,15 +549,15 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	}
 
 	// Fallback: structured encode (still preserves comments/order/indent)
+	// Fallback: encode from the yaml.v3 AST to preserve original quoting/comment styles
 	var buf bytes.Buffer
-	enc := gyaml.NewEncoder(
-		&buf, gyaml.Indent(indent), gyaml.IndentSequence(indentSeq), gyaml.WithComment(comments),
-	)
-	if err := enc.Encode(ordered); err != nil {
-		_ = enc.Close()
+	encV3 := yaml.NewEncoder(&buf)
+	encV3.SetIndent(indent)
+	if err := encV3.Encode(doc); err != nil {
+		_ = encV3.Close()
 		return nil, err
 	}
-	_ = enc.Close()
+	_ = encV3.Close()
 	return buf.Bytes(), nil
 }
 
@@ -619,22 +617,34 @@ func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 	cur := startMap
 	for _, k := range keys {
 		var found *yaml.Node
+		var keyNode *yaml.Node
 		for i := 0; i+1 < len(cur.Content); i += 2 {
 			if cur.Content[i].Kind == yaml.ScalarNode && cur.Content[i].Value == k {
+				keyNode = cur.Content[i]
 				found = cur.Content[i+1]
 				break
 			}
 		}
+
 		if found == nil {
 			key := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}
 			val := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			cur.Content = append(cur.Content, key, val)
+			keyNode = key
 			found = val
 		}
 		if found.Kind != yaml.MappingNode {
+			// Preserve comments, but keep the old inline comment on the *key* line
+			oldHead, oldLine, oldFoot, oldAnchor := found.HeadComment, found.LineComment, found.FootComment, found.Anchor
 			repl := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-			repl.HeadComment, repl.LineComment, repl.FootComment = found.HeadComment, found.LineComment, found.FootComment
-			repl.Anchor = found.Anchor
+			repl.HeadComment, repl.FootComment, repl.Anchor = oldHead, oldFoot, oldAnchor
+			// Clear the inline comment on the value; attach to key instead
+			if keyNode != nil && oldLine != "" {
+				// Only assign if the key doesn't already have an inline comment
+				if keyNode.LineComment == "" {
+					keyNode.LineComment = oldLine
+				}
+			}
 			*found = *repl
 		}
 		cur = found
@@ -3666,7 +3676,17 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 		replaced := false
 		for i := 0; i+1 < len(parent.Content); i += 2 {
 			if parent.Content[i].Kind == yaml.ScalarNode && parent.Content[i].Value == last.key {
+				old := parent.Content[i+1]
 				parent.Content[i+1] = yval
+				// If we replaced a scalar with a complex value, move its inline comment onto the key line
+				if old != nil && old.Kind == yaml.ScalarNode && (yval.Kind == yaml.MappingNode || yval.Kind == yaml.SequenceNode) {
+					if c := strings.TrimSpace(old.LineComment); c != "" {
+						if parent.Content[i].LineComment == "" {
+							parent.Content[i].LineComment = old.LineComment
+						}
+						old.LineComment = ""
+					}
+				}
 				replaced = true
 				break
 			}
@@ -3783,6 +3803,15 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 				// Remember previous value before we swap it out
 				oldChild = parent.Content[i+1]
 				parent.Content[i+1] = yval
+				// If old value was scalar and new is complex, keep the inline comment on the *key* line
+				if oldChild != nil && oldChild.Kind == yaml.ScalarNode && (yval.Kind == yaml.MappingNode || yval.Kind == yaml.SequenceNode) {
+					if c := strings.TrimSpace(oldChild.LineComment); c != "" {
+						if parent.Content[i].LineComment == "" {
+							parent.Content[i].LineComment = oldChild.LineComment
+						}
+						oldChild.LineComment = ""
+					}
+				}
 				found = true
 				break
 			}
