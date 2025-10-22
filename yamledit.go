@@ -439,7 +439,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	st.mu.RUnlock()
 
 	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, delSet)
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, indentSeq, delSet)
 	if okPatch {
 		// clear the flag if we succeeded surgically
 		if arraysDirty {
@@ -1221,6 +1221,7 @@ func marshalBySurgery(
 	valIdx map[string][]valueOcc,
 	seqIdx map[string]*seqInfo,
 	baseIndent int,
+	indentSeq bool,
 	deletions map[string]struct{},
 ) ([]byte, bool) {
 	if len(original) == 0 {
@@ -1274,7 +1275,7 @@ func marshalBySurgery(
 		}
 
 		// 3) Insert NEW keys (ints/strings) where safe
-		insertOK, insertPatches := buildInsertPatches(original, current, originalOrdered, mutableMI, baseIndent)
+		insertOK, insertPatches := buildInsertPatches(original, current, originalOrdered, mutableMI, baseIndent, indentSeq)
 		if !insertOK {
 			return nil, false
 		}
@@ -1560,7 +1561,9 @@ func buildSeqAppendPatches(
 				}
 				origArr, ok := getArrAtPath(originalOrdered, path, k)
 				if !ok {
-					return false
+					// New sequence path (no original anchor). Do not abort —
+					// new sequences are handled by buildInsertPatches.
+					continue
 				}
 				olen, nlen := len(origArr), len(v)
 				if nlen < olen {
@@ -2250,6 +2253,7 @@ func buildInsertPatches(
 	originalOrdered gyaml.MapSlice,
 	mapIdx map[string]*mapInfo,
 	baseIndent int,
+	indentSeq bool,
 ) (bool, []patch) {
 	var patches []patch
 
@@ -2285,6 +2289,123 @@ func buildInsertPatches(
 				if !walk(v, append(path, k)) {
 					return false
 				}
+			case []interface{}:
+				// New sequence key insertion (surgical)
+				if _, existed := origKeys[mpath][k]; !existed {
+					mi := mapIdx[mpath]
+					if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+						// No safe anchor to attach the new key bytes → bail to fallback.
+						return false
+					}
+					keyIndent := mi.indent
+					if keyIndent == 0 && len(path) > 0 {
+						keyIndent = baseIndent * len(path)
+					}
+					// Where to insert
+					insertPos := mi.lastLineEnd + 1
+					if insertPos < 0 || insertPos > len(original) {
+						return false
+					}
+					var sb strings.Builder
+					// If the anchor ended without newline, start a new line.
+					if mi.lastLineEnd >= 0 {
+						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
+							sb.WriteString("\n")
+						}
+					}
+					// Helper: render scalars like the rest of surgery does.
+					renderScalar := func(val interface{}) string {
+						switch vv := val.(type) {
+						case int:
+							return fmt.Sprintf("%d", vv)
+						case float64:
+							return strconv.FormatFloat(vv, 'g', -1, 64)
+						case bool:
+							if vv {
+								return "true"
+							}
+							return "false"
+						case string:
+							if isSafeBareString(vv) {
+								return vv
+							}
+							return quoteNewStringToken(vv)
+						case nil:
+							return "null"
+						default:
+							s := fmt.Sprint(vv)
+							if isSafeBareString(s) {
+								return s
+							}
+							return quoteNewStringToken(s)
+						}
+					}
+					// Render the new sequence block.
+					if len(v) == 0 {
+						// Empty array → single line key: []
+						sb.WriteString(strings.Repeat(" ", keyIndent))
+						sb.WriteString(k)
+						sb.WriteString(": []\n")
+					} else {
+						// Non-empty array → key line + items
+						sb.WriteString(strings.Repeat(" ", keyIndent))
+						sb.WriteString(k)
+						sb.WriteString(":\n")
+						itemIndent := keyIndent
+						if indentSeq {
+							itemIndent = keyIndent + baseIndent
+						}
+						for _, el := range v {
+							switch ev := el.(type) {
+							case gyaml.MapSlice:
+								// Render mapping item in non-inline style:
+								//   -\n
+								//     key: value
+								sb.WriteString(strings.Repeat(" ", itemIndent))
+								sb.WriteString("-\n")
+								kvIndent := itemIndent + baseIndent
+								for _, kv := range ev {
+									ks, _ := kv.Key.(string)
+									sb.WriteString(strings.Repeat(" ", kvIndent))
+									sb.WriteString(ks)
+									sb.WriteString(": ")
+									sb.WriteString(renderScalar(kv.Value))
+									sb.WriteString("\n")
+								}
+							case map[string]interface{}:
+								// Convert to ordered MapSlice for stable rendering
+								ms := gyaml.MapSlice{}
+								for kk, vv := range ev {
+									ms = append(ms, gyaml.MapItem{Key: kk, Value: vv})
+								}
+								sb.WriteString(strings.Repeat(" ", itemIndent))
+								sb.WriteString("-\n")
+								kvIndent := itemIndent + baseIndent
+								for _, kv := range ms {
+									ks, _ := kv.Key.(string)
+									sb.WriteString(strings.Repeat(" ", kvIndent))
+									sb.WriteString(ks)
+									sb.WriteString(": ")
+									sb.WriteString(renderScalar(kv.Value))
+									sb.WriteString("\n")
+								}
+							default:
+								// Scalar item
+								sb.WriteString(strings.Repeat(" ", itemIndent))
+								sb.WriteString("- ")
+								sb.WriteString(renderScalar(ev))
+								sb.WriteString("\n")
+							}
+						}
+					}
+					data := []byte(sb.String())
+					patches = append(patches, patch{start: insertPos, end: insertPos, data: data})
+					// Advance anchor for subsequent inserts into the same mapping.
+					mi.lastLineEnd = insertPos + len(data) - 1
+					mapIdx[mpath] = mi
+				}
+				// Recurse into sequence items is not needed for insertion phase.
+				// Any nested new keys will be handled when editing those items later.
 			case int:
 				// New key?
 				if _, existed := origKeys[mpath][k]; !existed {
