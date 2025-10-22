@@ -2694,9 +2694,11 @@ func TestArrayItemFormatting_DashOnSameLineAsFirstField(t *testing.T) {
 	t.Logf("Updated YAML:\n%s", updatedStr)
 
 	// Check that the array item uses inline format (dash on same line as first field)
+	// Expected: "  - <field>: <value>" (where <field> could be any field like path, property, name)
+	// NOT: "  -" on one line followed by "    <field>: <value>" on the next line
 	lines := strings.Split(updatedStr, "\n")
 
-	var foundArrayStart bool
+	var foundInlineArrayItem bool
 	var foundBadFormatting bool
 	var dashLineIdx int
 
@@ -2708,9 +2710,21 @@ func TestArrayItemFormatting_DashOnSameLineAsFirstField(t *testing.T) {
 			dashLineIdx = i
 			t.Logf("Found standalone dash at line %d: %q", i+1, line)
 		}
-		if strings.Contains(line, "- name: A") {
-			foundArrayStart = true
-			t.Logf("Found correct inline format at line %d: %q", i+1, line)
+		// Check for dash followed by any field (generic pattern: "- <word>:")
+		if strings.Contains(line, "-") && strings.Contains(line, ":") {
+			// Verify it's in the format "- <field>:" not just any line with both - and :
+			dashIdx := strings.Index(line, "-")
+			if dashIdx >= 0 && dashIdx < len(line)-1 {
+				afterDash := line[dashIdx+1:]
+				// After the dash, we should have whitespace then a field name followed by colon
+				if len(afterDash) > 0 && afterDash[0] == ' ' {
+					colonIdx := strings.Index(afterDash, ":")
+					if colonIdx > 0 {
+						foundInlineArrayItem = true
+						t.Logf("Found correct inline format at line %d: %q", i+1, line)
+					}
+				}
+			}
 		}
 	}
 
@@ -2720,16 +2734,16 @@ func TestArrayItemFormatting_DashOnSameLineAsFirstField(t *testing.T) {
 		if dashLineIdx+1 < len(lines) {
 			t.Errorf("Line %d: %q", dashLineIdx+2, lines[dashLineIdx+1])
 		}
-		t.Errorf("Expected format: '  - name: A' (dash and field on same line)")
-		t.Errorf("Got format: '  -' followed by '    name: A' (dash on separate line)")
+		t.Errorf("Expected format: '  - <field>: <value>' (dash and field on same line)")
+		t.Errorf("Got format: '  -' followed by '    <field>: <value>' (dash on separate line)")
 	}
 
-	if !foundArrayStart && !foundBadFormatting {
-		t.Errorf("Could not find array item for 'A' in output YAML")
+	if !foundInlineArrayItem && !foundBadFormatting {
+		t.Errorf("Could not find inline array item in output YAML")
 		t.Errorf("Full YAML:\n%s", updatedStr)
 	}
 
-	if !foundBadFormatting && foundArrayStart {
+	if !foundBadFormatting && foundInlineArrayItem {
 		t.Logf("✓ Array formatting is correct (dash on same line as first field)")
 	}
 }

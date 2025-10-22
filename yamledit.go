@@ -2646,24 +2646,26 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx
 	for pk := range deletions {
 		occs := valIdx[pk]
 		if len(occs) == 0 {
-			// No scalar line for this key. It might be a sequence or mapping value.
-			// If it is a sequence we indexed, delete the whole block (header + items).
-			// pk has the form "a\0b\0...<key>"
-			parts := strings.Split(pk, pathSep)
+			// No scalar line for this key. It might be a sequence (or complex value).
+			// Try to locate a previously indexed sequence and delete the whole block.
+			parts := strings.Split(pk, pathSep) // e.g. ["java-service","externalSecretEnvs"]
 			if len(parts) >= 1 {
-				seqPath := joinPath(parts) // joinPath copies; we actually need the full path, not just parent
-				// For sequences we indexed them with the full mapping path (parent + key).
-				if si, ok := globalSeqLookupForDeletion(seqPath); ok {
+				seqPath := joinPath(parts)
+				if si, ok := globalSeqLookupForDeletion(seqPath); ok && si != nil {
 					start := si.headerLineStart
 					end := si.headerLineEnd
-					if si.hasAnyItem && si.lastItemEnd >= end {
+					// Prefer our indexed lastItemEnd if it extends past the header.
+					if si.hasAnyItem && si.lastItemEnd > end {
 						end = si.lastItemEnd
+					} else {
+						// Fallback: scan forward from header to the next sibling key (indent drop).
+						end = scanSeqBlockEnd(original, si.headerLineStart, si.headerLineEnd)
 					}
-					// delete the newline after end if present
+					// include trailing newline if present
 					if end < len(original) && original[end] == '\n' {
 						end++
-					} else {
-						end++ // safe: Apply will clamp
+					} else if end+1 <= len(original) {
+						end++ // clamp later if needed
 					}
 					if start >= 0 && end >= start && end <= len(original) {
 						patches = append(patches, patch{start: start, end: end, data: []byte{}})
@@ -2671,7 +2673,7 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx
 					continue
 				}
 			}
-			// Otherwise: no surgical deletion for this key; fallback will handle it.
+			// Otherwise: no surgical deletion for this key; fallback encoder will remove it.
 			continue
 
 		}
@@ -2685,6 +2687,43 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx
 		}
 	}
 	return true, patches
+}
+
+// scanSeqBlockEnd scans forward from the sequence header to find the end of the block.
+// We stop when we hit a line whose indentation is <= the header's indentation (i.e., a sibling key)
+// or EOF. This robustly removes all items, including their nested lines and interspersed comments.
+func scanSeqBlockEnd(b []byte, headerStart, headerEnd int) int {
+	if headerStart < 0 || headerEnd < headerStart || headerEnd >= len(b) {
+		return headerEnd
+	}
+	hdrIndent := leadingSpaces(b[headerStart:headerEnd])
+	pos := headerEnd + 1
+	last := headerEnd
+	for pos < len(b) {
+		le := findLineEnd(b, pos)
+		if le < pos {
+			break
+		}
+		line := b[pos:le]
+		trim := bytes.TrimSpace(line)
+		ind := leadingSpaces(line)
+		if len(trim) == 0 {
+			// blank line: keep only if it's deeper than the header indent
+			if ind <= hdrIndent {
+				break
+			}
+			last = le
+			pos = le + 1
+			continue
+		}
+		// A sibling/ancestor key starts when indent drops back to headerIndent or less.
+		if ind <= hdrIndent {
+			break
+		}
+		last = le
+		pos = le + 1
+	}
+	return last
 }
 
 // globalSeqLookupForDeletion provides access to seqIndex for deletion,
