@@ -39,6 +39,7 @@ type docState struct {
 	mapIndex map[string]*mapInfo
 
 	// Scalar value positions (original) keyed by path + key (we store all occurrences to handle dups)
+	// Also stores scalar sequence items keyed by path + [index].
 	valueOccByPathKey map[string][]valueOcc
 
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
@@ -50,7 +51,7 @@ type docState struct {
 
 // Information about a sequence under a mapping path in the original YAML.
 type seqItemInfo struct {
-	name  string // value of "name" key if available
+	name  string // identity: value of "name" key if mapping, or scalar value itself (for fallback matching)
 	start int    // byte offset at the beginning of the item's first line ("- " ...)
 	end   int    // byte offset of the newline ending the last line of the item
 }
@@ -62,7 +63,7 @@ type seqInfo struct {
 	lastItemEnd    int // byte offset of the newline ending the last item's last line
 	hasAnyItem     bool
 	originalPath   bool
-	firstKeyInline bool          // whether first key appears on the same line as "- "
+	firstKeyInline bool          // whether first key (or scalar value) appears on the same line as "- "
 	keyOrder       []string      // preferred key order for items (captured from an existing item)
 	items          []seqItemInfo // per-item positions and names
 	gaps           [][]byte      // raw bytes between items; len = len(items)-1
@@ -98,9 +99,9 @@ type mapInfo struct {
 	originalPath bool // mapping existed in the original bytes
 }
 
-// One occurrence of "key: value" in the original file
+// One occurrence of "key: value" or "- value" in the original file
 type valueOcc struct {
-	keyLineStart int // start offset of the line where the key begins
+	keyLineStart int // start offset of the line where the key/item begins
 	valStart     int // start offset of the value token
 	valEnd       int // end offset (exclusive) of the value token
 	lineEnd      int // offset of '\n' ending this line (or len(original)-1 if final line has no \n)
@@ -249,26 +250,57 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 					lineEnd:      lineEnd,
 				})
 			}
-		} else if it.Kind == yaml.ScalarNode {
-			// Scalar item in a sequence, e.g. "- 8080  # comment"
-			valStart := offsetFor(st.lineOffsets, it.Line, it.Column)
-			if valStart >= 0 && valStart < len(st.original) {
-				valEnd := findScalarEndOnLine(st.original, valStart)
-				lineStart := lineStartOffset(st.lineOffsets, it.Line)
-				lineEnd := findLineEnd(st.original, valStart)
-				pk := makeSeqPathKey(cur, idx, scalarItemKey)
-				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
-					keyLineStart: lineStart,
-					valStart:     valStart,
-					valEnd:       valEnd,
-					lineEnd:      lineEnd,
-				})
-			}
 		}
 	}
 }
 
-// indexSequenceAnchors captures indent/style and insertion anchors for sequences.
+// indexScalarSeqPositions indexes positions for sequence items which are scalar nodes.
+func indexScalarSeqPositions(st *docState, seq *yaml.Node, cur []string) {
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return
+	}
+
+	// Optimization/Safety: Only process if it appears to be primarily a sequence of scalars.
+	// Mixed sequences (scalars and mappings) are complex; we prioritize mapping indexing.
+	isScalarSeq := true
+	for _, it := range seq.Content {
+		if it != nil && it.Kind != yaml.ScalarNode {
+			// If we find a non-scalar, we rely on indexSeqPositions (for mappings)
+			// or indexSequenceAnchors (for structure) but skip scalar indexing here
+			// to avoid conflicts if structure is complex.
+			isScalarSeq = false
+			break
+		}
+	}
+	if !isScalarSeq {
+		return
+	}
+
+	for idx, it := range seq.Content {
+		if it == nil {
+			continue
+		}
+
+		// We have a scalar item. Index its value position.
+		valStart := offsetFor(st.lineOffsets, it.Line, it.Column)
+		if valStart < 0 || valStart >= len(st.original) {
+			continue
+		}
+		valEnd := findScalarEndOnLine(st.original, valStart)
+		lineEnd := findLineEnd(st.original, valStart)
+
+		// We use the index path key format: path\x00[idx].
+		pk := makeSeqItemPathKey(cur, idx)
+		st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+			keyLineStart: lineStartOffset(st.lineOffsets, it.Line),
+			valStart:     valStart,
+			valEnd:       valEnd,
+			lineEnd:      lineEnd,
+		})
+	}
+}
+
+// indexSequenceAnchors captures indent/style and insertion anchors for sequences (both scalars and mappings).
 func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 	mpath := joinPath(cur)
 	si := st.seqIndex[mpath]
@@ -281,40 +313,34 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 		return
 	}
 	si.hasAnyItem = true
-	// First item start anchor
-	first := seq.Content[0]
-	if first.Kind == yaml.MappingNode && len(first.Content) >= 2 {
-		fk := first.Content[0]
-		si.firstItemStart = lineStartOffset(st.lineOffsets, fk.Line)
-	} else {
-		si.firstItemStart = lineStartOffset(st.lineOffsets, first.Line)
-	}
-	// Detect base indent from the first item's line even for scalar sequences.
-	{
-		ls := lineStartOffset(st.lineOffsets, first.Line)
-		le := findLineEnd(st.original, ls)
-		ln := st.original[ls:le]
-		si.indent = leadingSpaces(ln)
-	}
-	// Per‑item boundaries and names
+
+	// Per‑item boundaries and identities (name or scalar value)
 	si.items = si.items[:0]
-	// Detect style/indent/key order from the FIRST mapping item we see (for stability).
+
+	// Detect style/indent/key order from the FIRST item we see (for stability).
 	detectedStyle := false
+
 	computeItemBounds := func(it *yaml.Node) (start int, end int, name string) {
-		// start
+		if it == nil {
+			return
+		}
+		// start (beginning of the first line of the item)
 		if it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
 			fk := it.Content[0]
 			start = lineStartOffset(st.lineOffsets, fk.Line)
 		} else {
 			start = lineStartOffset(st.lineOffsets, it.Line)
 		}
-		// end
+
+		// end (newline ending the last line of the item)
 		if it.Kind == yaml.MappingNode {
 			maxEnd := 0
+			// Find the end of the last value in the mapping
 			for j := 0; j+1 < len(it.Content); j += 2 {
 				if it.Content[j+1] == nil {
 					continue
 				}
+				// Use Line/Column of the value node to find its start offset, then find line end.
 				vs := offsetFor(st.lineOffsets, it.Content[j+1].Line, it.Content[j+1].Column)
 				if vs >= 0 && vs < len(st.original) {
 					le := findLineEnd(st.original, vs)
@@ -323,12 +349,19 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 					}
 				}
 			}
-			end = maxEnd
+			// If mapping is empty or we couldn't determine end, use start line end.
+			if maxEnd == 0 {
+				end = findLineEnd(st.original, start)
+			} else {
+				end = maxEnd
+			}
 		} else {
-			ls := lineStartOffset(st.lineOffsets, it.Line)
-			end = findLineEnd(st.original, ls)
+			// Scalar or other node types: end of the line where the node starts.
+			// We use start which was already calculated correctly for scalars.
+			end = findLineEnd(st.original, start)
 		}
-		// name (best-effort)
+
+		// name (best-effort identity: "name" field value or scalar value)
 		if it.Kind == yaml.MappingNode {
 			for j := 0; j+1 < len(it.Content); j += 2 {
 				k := it.Content[j]
@@ -338,48 +371,110 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 					break
 				}
 			}
+		} else if it.Kind == yaml.ScalarNode {
+			// Use scalar value as identity (yaml.v3 stores string representation in Value)
+			name = it.Value
 		}
-		// Detect style/indent/key order once from a mapping item
-		if !detectedStyle && it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
-			firstK := it.Content[0]
-			ls := lineStartOffset(st.lineOffsets, firstK.Line)
-			le := findLineEnd(st.original, ls)
-			ln := st.original[ls:le]
+
+		// Detect style/indent/key order once
+		if !detectedStyle {
+			// We reuse 'start' which points to the beginning of the first line of the item.
+			le := findLineEnd(st.original, start)
+
+			// Check bounds before slicing. 'start' must be valid index.
+			if start < 0 || start >= len(st.original) {
+				return // Cannot determine style if start is invalid
+			}
+
+			// Determine slice end boundary safely for style analysis (excluding the newline itself if present)
+			lnEnd := le
+			if le < len(st.original) && st.original[le] == '\n' {
+				// le points to '\n', so lnEnd is correct for exclusive slice end.
+			} else if le == len(st.original)-1 {
+				lnEnd = len(st.original) // EOF case, slice to the end
+			}
+
+			// Ensure ln slice is valid
+			if start >= lnEnd {
+				// Empty line or invalid range
+				return
+			}
+
+			ln := st.original[start:lnEnd]
+
 			si.indent = leadingSpaces(ln)
-			si.firstKeyInline = firstNonSpaceByte(ln) == '-'
-			kvIndent := 0
-			for j := 0; j+1 < len(it.Content); j += 2 {
-				k := it.Content[j]
-				ks := lineStartOffset(st.lineOffsets, k.Line)
-				ke := findLineEnd(st.original, ks)
-				kl := st.original[ks:ke]
-				if firstNonSpaceByte(kl) == '-' {
-					continue
+			si.firstKeyInline = firstNonSpaceByte(ln) == '-' // True if block style ("- ...")
+
+			if it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
+				// Detailed mapping style detection (kvIndent, keyOrder)
+				kvIndent := 0
+
+				// Calculate kvIndent (indent of keys inside the mapping item)
+				for j := 0; j+1 < len(it.Content); j += 2 {
+					k := it.Content[j]
+					ks := lineStartOffset(st.lineOffsets, k.Line)
+					ke := findLineEnd(st.original, ks)
+
+					if ks < 0 || ks >= len(st.original) {
+						continue
+					}
+
+					// Safe slicing for key line
+					klEnd := ke
+					if ke < len(st.original) && st.original[ke] == '\n' {
+					} else if ke == len(st.original)-1 {
+						klEnd = len(st.original)
+					}
+
+					if ks >= klEnd {
+						continue
+					}
+
+					kl := st.original[ks:klEnd]
+
+					// Skip the first line if it starts with '-' (handled by si.firstKeyInline)
+					if firstNonSpaceByte(kl) == '-' {
+						continue
+					}
+					sp := leadingSpaces(kl)
+					if kvIndent == 0 || (sp > 0 && sp < kvIndent) {
+						kvIndent = sp
+					}
 				}
-				sp := leadingSpaces(kl)
-				if kvIndent == 0 || sp < kvIndent {
-					kvIndent = sp
+
+				if kvIndent == 0 {
+					// Default if only inline key exists or mapping structure is unusual
+					kvIndent = si.indent + st.indent
 				}
-			}
-			if kvIndent == 0 {
-				kvIndent = si.indent + st.indent
-			}
-			si.itemKVIndent = kvIndent
-			order := make([]string, 0, len(it.Content)/2)
-			for j := 0; j+1 < len(it.Content); j += 2 {
-				if it.Content[j].Kind == yaml.ScalarNode {
-					order = append(order, it.Content[j].Value)
+				si.itemKVIndent = kvIndent
+
+				// Key order
+				order := make([]string, 0, len(it.Content)/2)
+				for j := 0; j+1 < len(it.Content); j += 2 {
+					if it.Content[j].Kind == yaml.ScalarNode {
+						order = append(order, it.Content[j].Value)
+					}
 				}
+				si.keyOrder = order
+			} else {
+				// Scalar item or empty/simple mapping. Set defaults.
+				si.itemKVIndent = si.indent + st.indent
+				si.keyOrder = nil
 			}
-			si.keyOrder = order
 			detectedStyle = true
 		}
 		return
 	}
+
 	// First item start
-	first = seq.Content[0]
+	first := seq.Content[0]
+	if first == nil {
+		return
+	}
+
 	fs, _, _ := computeItemBounds(first)
 	si.firstItemStart = fs
+
 	// Items & last end
 	lastEnd := 0
 	si.items = make([]seqItemInfo, 0, len(seq.Content))
@@ -391,10 +486,13 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 		si.items = append(si.items, seqItemInfo{name: nm, start: s, end: e})
 	}
 	si.lastItemEnd = lastEnd
-	// Gaps between items (raw)
+
+	// Gaps between items (raw bytes including comments/newlines)
 	if len(si.items) >= 2 {
 		si.gaps = make([][]byte, len(si.items)-1)
 		for i := 0; i < len(si.items)-1; i++ {
+			// Gap starts after the newline of the previous item and ends at the start of the next item.
+			// si.items[i].end points to the newline character (or EOF marker).
 			gStart := si.items[i].end + 1
 			gEnd := si.items[i+1].start
 			if gStart >= 0 && gEnd >= gStart && gEnd <= len(st.original) {
@@ -1164,22 +1262,30 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 
 		// For scalars, we can anchor at the value line.
 		valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
+		// We restrict indexing in valueOccByPathKey to scalars, as replacement logic relies on it.
+		// We still update anchoring (lastLineEnd, hasAnyKey) for all kinds if valStart is valid.
 		if valStart >= 0 && valStart < len(st.original) {
-			valEnd := findScalarEndOnLine(st.original, valStart)
-			lineEnd := findLineEnd(st.original, valStart)
 
-			pk := makePathKey(cur, key)
-			st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
-				keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
-				valStart:     valStart,
-				valEnd:       valEnd,
-				lineEnd:      lineEnd,
-			})
+			if v.Kind == yaml.ScalarNode {
+				valEnd := findScalarEndOnLine(st.original, valStart)
+				lineEnd := findLineEnd(st.original, valStart)
 
-			// Track last line in this mapping to attach future insertions
-			if lineEnd > mi.lastLineEnd {
-				mi.lastLineEnd = lineEnd
+				pk := makePathKey(cur, key)
+				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+					keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
+					valStart:     valStart,
+					valEnd:       valEnd,
+					lineEnd:      lineEnd,
+				})
+
+				// Track last line in this mapping to attach future insertions
+				if lineEnd > mi.lastLineEnd {
+					mi.lastLineEnd = lineEnd
+				}
 			}
+			mi.hasAnyKey = true
+		} else {
+			// If valStart is invalid (e.g. empty value), still mark that key exists.
 			mi.hasAnyKey = true
 		}
 
@@ -1194,9 +1300,15 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			seqPath := append(cur, key)
 			// Index scalars inside sequence items (if they are mappings).
 			indexSeqPositions(st, v, seqPath)
+			// Index scalar items if it's a sequence of scalars.
+			indexScalarSeqPositions(st, v, seqPath)
 			// Capture anchors/indent for append surgery.
 			indexSequenceAnchors(st, v, seqPath)
-			// Note: we do not modify mapIndex.lastLineEnd for sequences.
+
+			// Update parent mapping's lastLineEnd if the sequence extends past it.
+			if seqInfo := st.seqIndex[joinPath(seqPath)]; seqInfo != nil && seqInfo.lastItemEnd > mi.lastLineEnd {
+				mi.lastLineEnd = seqInfo.lastItemEnd
+			}
 		}
 	}
 }
@@ -1239,8 +1351,10 @@ func marshalBySurgery(
 	for ok := range []int{0} {
 		_ = ok                             // keep the block to allow early returns neatly
 		mutableMI := cloneMapIndex(mapIdx) // local copy to advance insertion anchors
-		// Replace entire sequence blocks when array "shape" changed (remove/add/reorder)
-		seqReplOK, seqReplPatches, replacedSeqs := buildSeqReplaceBlockPatches(original, current, originalOrdered, seqIdx, baseIndent)
+
+		// Replace entire sequence blocks when array "shape" changed (remove/add/reorder/value change in scalar array).
+		// We pass valIdx to allow microsurgery during block regeneration for scalar arrays.
+		seqReplOK, seqReplPatches, replacedSeqs := buildSeqReplaceBlockPatches(original, current, originalOrdered, seqIdx, baseIndent, valIdx)
 		if !seqReplOK {
 			return nil, false
 		}
@@ -1251,7 +1365,7 @@ func marshalBySurgery(
 		}
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
-		//    including inside arrays of mappings.
+		//    including inside arrays of mappings. (Scalar arrays handled above now).
 		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx, seqIdx, replacedSeqs)
 		if !replaceOK {
 			return nil, false
@@ -1285,7 +1399,7 @@ func marshalBySurgery(
 		}
 
 		// 3b) Append NEW items to sequences (arrays) at the end (safe styles only).
-		//     Skip sequences we fully replaced above.
+		//     Skip sequences we fully replaced above. (This is now redundant if buildSeqReplaceBlockPatches handles appends).
 		seqOK, seqPatches := buildSeqAppendPatches(original, current, originalOrdered, seqIdx, baseIndent, replacedSeqs)
 		if !seqOK {
 			return nil, false
@@ -1344,13 +1458,23 @@ func marshalBySurgery(
 	cursor := 0
 	for _, p := range patches {
 		if p.start < cursor || p.end < p.start || p.end > len(original) {
+			// Check for valid range, allowing insertion at the end (p.start == len(original))
+			if !(p.start == len(original) && p.end == len(original) && p.start >= cursor) {
+				return nil, false
+			}
+		}
+		if p.start > len(original) {
+			// Should have been caught above
 			return nil, false
 		}
+
 		out.Write(original[cursor:p.start])
 		out.Write(p.data)
 		cursor = p.end
 	}
-	out.Write(original[cursor:])
+	if cursor < len(original) {
+		out.Write(original[cursor:])
+	}
 	return out.Bytes(), true
 }
 
@@ -1940,22 +2064,10 @@ func buildSeqReplaceBlockPatches(
 	originalOrdered gyaml.MapSlice,
 	seqIdx map[string]*seqInfo,
 	baseIndent int,
+	valIdx map[string][]valueOcc, // Added valIdx for hybrid surgery
 ) (bool, []patch, map[string]struct{}) {
 	var patches []patch
 	replaced := map[string]struct{}{}
-
-	// Helper: is every element in arr a scalar (non-map, non-array)?
-	isArrayOfScalars := func(arr []interface{}) bool {
-		for _, el := range arr {
-			switch el.(type) {
-			case gyaml.MapSlice, map[string]interface{}, []interface{}:
-				return false
-			default:
-				// ints, float64, bool, string, nil → scalar
-			}
-		}
-		return true
-	}
 
 	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
 	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
@@ -2002,7 +2114,29 @@ func buildSeqReplaceBlockPatches(
 			return gyaml.MapSlice{}, false
 		}
 	}
+	// Helper to convert scalar interface{} to string for identity matching.
+	// Must be consistent with how yaml.v3 parses values into Node.Value during indexing.
+	scalarToString := func(v interface{}) (string, bool) {
+		switch vv := v.(type) {
+		case string:
+			return vv, true
+		case int:
+			return strconv.Itoa(vv), true
+		case int64:
+			return strconv.FormatInt(vv, 10), true
+		case float64:
+			return strconv.FormatFloat(vv, 'g', -1, 64), true
+		case bool:
+			return strconv.FormatBool(vv), true
+		case nil:
+			// YAML null can be represented as "null" or "~" or empty. We use "null" for canonical identity.
+			return "null", true
+		default:
+			return "", false
+		}
+	}
 
+	// Extracts identity ("name" field or scalar value) from array items.
 	namesOf := func(arr []interface{}) ([]string, bool) {
 		out := make([]string, len(arr))
 		for i, el := range arr {
@@ -2011,7 +2145,8 @@ func buildSeqReplaceBlockPatches(
 				found := false
 				for _, kv := range it {
 					if ks, ok := kv.Key.(string); ok && ks == "name" {
-						if sv, ok2 := kv.Value.(string); ok2 {
+						// Use scalarToString for consistency
+						if sv, ok2 := scalarToString(kv.Value); ok2 {
 							out[i] = sv
 							found = true
 							break
@@ -2019,16 +2154,27 @@ func buildSeqReplaceBlockPatches(
 					}
 				}
 				if !found {
+					// If we cannot establish identity for a mapping item (e.g. no "name" field or "name" is complex), bail out.
 					return nil, false
 				}
 			case map[string]interface{}:
-				if v, ok := it["name"].(string); ok {
-					out[i] = v
+				if v, ok := it["name"]; ok {
+					if sv, ok2 := scalarToString(v); ok2 {
+						out[i] = sv
+					} else {
+						return nil, false
+					}
 				} else {
 					return nil, false
 				}
+			// Handle scalars
 			default:
-				return nil, false
+				if sv, ok := scalarToString(it); ok {
+					out[i] = sv
+				} else {
+					// Complex type (e.g. nested array) or unknown type.
+					return nil, false
+				}
 			}
 		}
 		return out, true
@@ -2037,7 +2183,7 @@ func buildSeqReplaceBlockPatches(
 	getName := func(ms gyaml.MapSlice) string {
 		for _, it := range ms {
 			if ks, ok := it.Key.(string); ok && ks == "name" {
-				if sv, ok2 := it.Value.(string); ok2 {
+				if sv, ok2 := scalarToString(it.Value); ok2 {
 					return sv
 				}
 			}
@@ -2145,7 +2291,6 @@ func buildSeqReplaceBlockPatches(
 		}
 		return sb.String(), true
 	}
-
 	shapeChanged := func(oldArr, newArr []interface{}) bool {
 		if len(oldArr) != len(newArr) {
 			return true
@@ -2156,6 +2301,7 @@ func buildSeqReplaceBlockPatches(
 			// conservative: if we cannot match items by stable identity, treat as shape change
 			return true
 		}
+		// Check if order changed (identity comparison)
 		for i := range oldNames {
 			if oldNames[i] != newNames[i] {
 				return true
@@ -2179,23 +2325,31 @@ func buildSeqReplaceBlockPatches(
 			case []interface{}:
 				origArr, ok := getArrAtPath(originalOrdered, path, k)
 				if !ok {
-					// no original anchor to replace against → cannot perform surgical block replace
+					// New array; cannot perform surgical block replace as we don't have anchors.
 					continue
 				}
 				mpath := joinPath(append(path, k))
 				si := seqIdx[mpath]
-				if si == nil || !si.originalPath || !si.hasAnyItem || si.firstItemStart <= 0 || si.lastItemEnd <= 0 {
+				// Ensure we have valid anchors from the original parse.
+				if si == nil || !si.originalPath || !si.hasAnyItem || si.firstItemStart < 0 || si.lastItemEnd < 0 {
 					continue
 				}
-				if isArrayOfScalars(origArr) && isArrayOfScalars(v) {
-					// Let later passes (scalar replacements + appends) handle this surgically.
-					// Do NOT mark as replaced and do NOT return failure.
-					continue
-				}
+
+				// Check if the structure or order changed.
+				// We also treat value changes in scalar arrays as "shape change" here (since value is identity) to trigger hybrid surgery.
 				if !shapeChanged(origArr, v) {
+					// If shape (identities/order) didn't change, rely on buildReplacementPatches for mapping updates.
+					// For scalars, if shape didn't change, values (identities) are the same, so nothing to do.
 					continue
 				}
-				// Build "pre-gap" map: next item's name -> gap bytes that preceded it
+
+				// If we are here, the array changed (length, order, or content/identity).
+
+				// --- Block Replacement Logic (Hybrid Approach) ---
+				O := len(origArr)
+				seqPath := append(append([]string{}, path...), k)
+
+				// Build "pre-gap" map for fallback rendering if surgery isn't possible for an item.
 				preGap := map[string][]byte{}
 				if len(si.items) >= 2 && len(si.gaps) == len(si.items)-1 {
 					for i := 0; i < len(si.items)-1; i++ {
@@ -2205,33 +2359,132 @@ func buildSeqReplaceBlockPatches(
 						}
 						g := si.gaps[i]
 						if len(g) > 0 {
-							preGap[nextName] = g
+							// Associate gap with the identity of the item that followed it.
+							if _, exists := preGap[nextName]; !exists {
+								preGap[nextName] = g
+							}
 						}
 					}
 				}
+
+				// Helper for fallback identity extraction
+				getItemIdentity := func(item interface{}) string {
+					if ms, ok := toMapSlice(item); ok {
+						return getName(ms)
+					}
+					if sv, ok := scalarToString(item); ok {
+						return sv
+					}
+					return ""
+				}
+
 				// Render new block
 				var sb strings.Builder
-				for _, el := range v {
-					msItem, ok := toMapSlice(el)
-					if !ok {
-						return false
-					}
-					if nm := getName(msItem); nm != "" {
-						if g, ok := preGap[nm]; ok && len(g) > 0 {
-							sb.Write(g)
+				for i, el := range v {
+
+					// --- Hybrid Surgical Replacement (Index Alignment) ---
+					// Try surgical replacement if the index existed originally AND the item is still a scalar.
+					if i < O && i < len(si.items) {
+						// Check if the new item is a scalar.
+						isScalar := false
+						switch el.(type) {
+						case string, int, int64, float64, bool, nil:
+							isScalar = true
+						}
+
+						if isScalar {
+							// Check if we have index information for a scalar at this position (indexed by indexScalarSeqPositions).
+							pk := makeSeqItemPathKey(seqPath, i)
+							occs := valIdx[pk]
+
+							if len(occs) > 0 {
+								last := occs[len(occs)-1]
+								itemInfo := si.items[i]
+
+								// Perform surgical replacement.
+								start := itemInfo.start
+								valStart := last.valStart
+								valEnd := last.valEnd
+								// itemInfo.end points to the newline char or EOF-1. Add 1 to include it.
+								end := itemInfo.end + 1
+								if end > len(original) {
+									end = len(original)
+								}
+
+								// Boundary checks
+								if start >= 0 && valStart >= start && valEnd >= valStart && end >= valEnd && end <= len(original) {
+
+									// 1. Preserve Gap at this index position (from original gaps).
+									if i > 0 && i-1 < len(si.gaps) {
+										if gap := si.gaps[i-1]; len(gap) > 0 {
+											sb.Write(gap)
+										}
+									}
+
+									// 2. Write prefix (indent, "- ")
+									sb.Write(original[start:valStart])
+
+									// 3. Write new value.
+									oldTok := bytes.TrimSpace(original[valStart:valEnd])
+									var newValBytes []byte
+
+									if sval, ok := el.(string); ok {
+										// Respect original quoting style if possible.
+										newValBytes = stringReplacementToken(oldTok, sval)
+									} else {
+										// Use canonical rendering for non-strings.
+										newValBytes = []byte(renderScalar(el))
+									}
+									sb.Write(newValBytes)
+
+									// 4. Write suffix (whitespace, inline comment, newline)
+									sb.Write(original[valEnd:end])
+									continue // Done surgically
+								}
+							}
 						}
 					}
-					txt, ok := renderItem(si, msItem)
-					if !ok {
-						return false
+					// --------------------------------------------------------------------
+
+					// Fallback rendering (for appends, mappings, or when surgery failed/not applicable).
+
+					// Try to preserve gaps using the identity-based preGap map (useful if reordering occurred).
+					nm := getItemIdentity(el)
+					if nm != "" {
+						if g, ok := preGap[nm]; ok && len(g) > 0 {
+							sb.Write(g)
+							// Consume gap if used.
+							delete(preGap, nm)
+						}
 					}
-					sb.WriteString(txt)
-				}
+
+					// Re-render the item.
+					if msItem, okMap := toMapSlice(el); okMap {
+						// Render mapping item
+						txt, ok := renderItem(si, msItem)
+						if !ok {
+							return false
+						}
+						sb.WriteString(txt)
+					} else {
+						// Render scalar item (Fallback rendering)
+						sb.WriteString(strings.Repeat(" ", si.indent))
+						sb.WriteString("- ")
+						sb.WriteString(renderScalar(el))
+						sb.WriteString("\n")
+					}
+				} // end loop
+
 				start := si.firstItemStart
-				end := si.lastItemEnd + 1 // include trailing newline
-				if start < 0 || end < start || end > len(original) {
+				end := si.lastItemEnd + 1 // include trailing newline (or extends to EOF)
+
+				if start < 0 || end < start {
 					return false
 				}
+				if end > len(original) {
+					end = len(original)
+				}
+
 				patches = append(patches, patch{start: start, end: end, data: []byte(sb.String())})
 				replaced[mpath] = struct{}{}
 			}
@@ -2527,6 +2780,15 @@ func makePathKey(path []string, key string) string {
 		return key
 	}
 	return strings.Join(append(append([]string{}, path...), key), pathSep)
+}
+
+// makeSeqItemPathKey builds the index key for a scalar item at a sequence index.
+// Format: path\x00[idx]
+func makeSeqItemPathKey(path []string, idx int) string {
+	segs := make([]string, 0, len(path)+1)
+	segs = append(segs, path...)
+	segs = append(segs, fmt.Sprintf("[%d]", idx))
+	return strings.Join(segs, pathSep)
 }
 
 func buildLineOffsets(b []byte) []int {
@@ -3884,6 +4146,8 @@ func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{})
 // seqItemNames extracts the "name" scalar from each mapping item in a sequence.
 // Returns (names, true) only if every item is a mapping and has a string scalar "name".
 func seqItemNames(seq *yaml.Node) ([]string, bool) {
+	// This function is used by opReplace (in the original file) to check shape change for mapping arrays.
+	// We keep its original behavior (only checks mappings) as the new hybrid surgery logic handles scalars separately.
 	if seq == nil || seq.Kind != yaml.SequenceNode {
 		return nil, false
 	}
