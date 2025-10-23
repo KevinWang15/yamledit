@@ -2826,3 +2826,144 @@ func TestArrayDeletion_RemovesAllLines(t *testing.T) {
 
 	t.Logf("✓ Array deletion test complete")
 }
+
+// TestDeleteKey_PreservesInlineCommentWhitespace verifies that DeleteKey + Marshal
+// preserves the exact whitespace before inline comments in unrelated fields.
+// This reproduces a bug where deleting one field normalizes comment whitespace in other fields.
+func TestDeleteKey_PreservesInlineCommentWhitespace(t *testing.T) {
+	// YAML with a field that has 2 spaces before its inline comment
+	original := `service:
+  config:
+    field1: 'value1'
+    field2: 'value2'  # this comment has 2 spaces before the hash
+    field3: 'value3'
+  arrayField:
+    - item1
+    - item2
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Delete arrayField (simulates cascade deletion scenario)
+	serviceNode := EnsurePath(doc, "service")
+	DeleteKey(serviceNode, "arrayField")
+
+	// Marshal back
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	outputStr := string(out)
+	t.Logf("Output YAML:\n%s", outputStr)
+
+	// Check if original bytes are preserved (byte surgery succeeded)
+	if strings.Contains(string(out), "'value2'  #") {
+		t.Logf("✓ Byte surgery succeeded - whitespace preserved")
+	} else {
+		t.Logf("✗ Fell back to yaml encoder - whitespace normalized")
+	}
+
+	// Find the line with field2
+	lines := strings.Split(outputStr, "\n")
+	var field2Line string
+	for _, line := range lines {
+		if strings.Contains(line, "field2") {
+			field2Line = line
+			break
+		}
+	}
+
+	if field2Line == "" {
+		t.Fatalf("Could not find field2 line in output")
+	}
+
+	t.Logf("field2 line: %q", field2Line)
+
+	// Check that there are still 2 spaces before the # comment
+	if !strings.Contains(field2Line, "'value2'  #") {
+		t.Errorf("Expected 2 spaces before '#' in comment, but got: %q", field2Line)
+
+		// Count spaces to report
+		if strings.Contains(field2Line, "'value2' #") {
+			t.Errorf("Comment whitespace was normalized from 2 spaces to 1 space")
+		}
+	}
+}
+
+// TestDeleteKey_PreservesInlineCommentWhitespace2 verifies that DeleteKey + Marshal
+// preserves the exact whitespace before inline comments in unrelated fields.
+// This reproduces a bug where deleting one field normalizes comment whitespace in other fields.
+func TestDeleteKey_PreservesInlineCommentWhitespace2(t *testing.T) {
+	// YAML with a field that has 2 spaces before its inline comment
+	original := `service:
+  config:
+    field1: 'value1'
+    field2: 'value2'  # this comment has 2 spaces before the hash
+    field3: 'value3'
+  arrayField:
+    - item1
+    - item2
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Delete arrayField
+	patch, err := jsonpatch.DecodePatch([]byte(`[
+		{"op":"remove","path":"/arrayField"}
+	]`))
+	if err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if err := ApplyJSONPatchAtPath(doc, patch, []string{"service"}); err != nil {
+		t.Fatalf("PatchData error: %v", err)
+	}
+
+	// Marshal back
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	outputStr := string(out)
+	t.Logf("Output YAML:\n%s", outputStr)
+
+	// Check if original bytes are preserved (byte surgery succeeded)
+	if strings.Contains(string(out), "'value2'  #") {
+		t.Logf("✓ Byte surgery succeeded - whitespace preserved")
+	} else {
+		t.Logf("✗ Fell back to yaml encoder - whitespace normalized")
+	}
+
+	// Find the line with field2
+	lines := strings.Split(outputStr, "\n")
+	var field2Line string
+	for _, line := range lines {
+		if strings.Contains(line, "field2") {
+			field2Line = line
+			break
+		}
+	}
+
+	if field2Line == "" {
+		t.Fatalf("Could not find field2 line in output")
+	}
+
+	t.Logf("field2 line: %q", field2Line)
+
+	// Check that there are still 2 spaces before the # comment
+	if !strings.Contains(field2Line, "'value2'  #") {
+		t.Errorf("Expected 2 spaces before '#' in comment, but got: %q", field2Line)
+
+		// Count spaces to report
+		if strings.Contains(field2Line, "'value2' #") {
+			t.Errorf("Comment whitespace was normalized from 2 spaces to 1 space")
+		}
+	}
+}
