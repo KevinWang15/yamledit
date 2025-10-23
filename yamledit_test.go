@@ -2308,9 +2308,6 @@ java-service:
 
 // TestArrayOfScalars_EditPreserveCommentsMinimalDiff
 // Expects surgical behavior & comment preservation on a sequence of scalars.
-// This test is expected to FAIL with the current implementation because arrays
-// of scalars fall back to a structured re-encode, which drops inter-item comments
-// and causes multi-line diffs.
 func TestArrayOfScalars_EditPreserveCommentsMinimalDiff(t *testing.T) {
 	original := `service:
   ports:

@@ -1,32 +1,77 @@
 # yamledit
 
-A minimal Go package for **precise YAML editing** that preserves comments, formatting, and structure — now with **byte-surgical editing** to avoid noisy diffs.
+A Go package for **surgical YAML edits** that preserves comments, formatting, key order, and minimizes diffs.
+Think: *change exactly the bytes you mean to - leave everything else untouched.*
 
-## Features
+- **Zero‑churn scalars.** Update ints/strings/bools/floats/null in place, keeping quote style, spaces, and inline
+  comments.
+- **Append without reflow.** Insert new keys/items at the _right_ indent and position.
+- **JSON Patch built‑in.** Apply RFC‑6902 patches (optionally at a base path) with minimal diffs when safe.
+- **Thread‑safe.** Concurrent edits are safe.
 
-* **Byte-Surgical Editing (No Churn)** – Only the bytes for values you actually change are touched. Unrelated lines remain byte-for-byte identical (quotes, spaces, inline comments, etc.).
-* **Preserves Comments** – All `# …` comments and inline comments are maintained.
-* **Preserves Formatting** – Maintains original indentation (auto-detected, including indentless sequences).
-* **Preserves Key Order** – Original key order is maintained; **new keys are appended** to their mapping.
-* **Thread-Safe** – Concurrent edits are safe.
-* **Minimal API** – Just 4 functions for all operations.
+> **Why not parse & re‑encode?** Re‑encoding churns quotes, spaces, and comment whitespace. `yamledit` indexes exact
+> byte positions so unrelated lines are **byte‑for‑byte identical**.
+
+---
 
 ## Installation
 
 ```bash
 go get github.com/kevinwang15/yamledit
+````
+
+Go 1.21+
+
+---
+
+## Quick start
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/kevinwang15/yamledit"
+	"gopkg.in/yaml.v3"
+)
+
+func main() {
+	// 1) Read and parse (top-level must be a mapping; empty is okay)
+	data, _ := os.ReadFile("config.yaml")
+	doc, err := yamledit.Parse(data)
+	if err != nil {
+		panic(err)
+	}
+
+	// 2) Navigate/create nested mappings
+	env := yamledit.EnsurePath(doc, "service", "env")
+
+	// 3) Surgical scalar updates (quotes & inline comments on other lines preserved)
+	yamledit.SetScalarInt(env, "PORT", 9090)
+	yamledit.SetScalarBool(env, "METRICS_ENABLED", true)
+	yamledit.SetScalarString(env, "GREETING", "hi") // keeps prior quote style if it existed
+	yamledit.SetScalarNull(env, "DEPRECATED")       // !!null
+
+	// 4) Delete keys surgically (removes full blocks, including arrays)
+	yamledit.DeleteKey(env, "OLD_FLAG")
+
+	// 5) Marshal back (surgery when safe; structured fallback when needed)
+	out, err := yamledit.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := os.WriteFile("config.yaml", out, 0o644); err != nil {
+		panic(err)
+	}
+	fmt.Println("Updated config.yaml")
+	_ = yaml.Node{} // just to show the import, not required further
+}
 ```
 
-## API
-
-The package provides just 4 functions:
-
-* `Parse(data []byte) (*yaml.Node, error)` – Parse YAML from bytes (top-level must be a mapping).
-* `Marshal(doc *yaml.Node) ([]byte, error)` – Serialize back to bytes (surgical when safe, falls back if needed).
-* `EnsurePath(doc *yaml.Node, keys ...string) *yaml.Node` – Navigate/create nested paths (always returns a mapping node).
-* `SetScalarInt(mapNode *yaml.Node, key string, value int)` – Set integer values under a mapping node.
-
-### Example: no quote churn
+**No quote churn example**
 
 Input:
 
@@ -54,97 +99,116 @@ env:
   port: 9090
 ```
 
-## Usage
+---
+
+## API overview
+
+> All functions are in `github.com/kevinwang15/yamledit`.
+
+### Core
+
+* `Parse(data []byte) (*yaml.Node, error)`
+  Parse bytes into a `yaml.Node`. Top‑level **must** be a mapping (empty input creates an empty mapping document).
+
+* `Marshal(doc *yaml.Node) ([]byte, error)`
+  Serialize back to bytes. Performs **byte‑surgical** edits when safe, and **falls back** to AST encode when structure
+  changes—still preserving comments, indent, and key order.
+
+* `EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node`
+  Navigate/create nested mappings, starting from a `DocumentNode` **or** an inner `MappingNode`. Returns the mapping
+  node at that path.
+
+### Scalar setters (surgical updates)
+
+* `SetScalarInt(mapNode *yaml.Node, key string, value int)`
+* `SetScalarString(mapNode *yaml.Node, key, value string)`
+* `SetScalarBool(mapNode *yaml.Node, key string, value bool)` → **canonicalizes to bare** `true`/`false`
+* `SetScalarFloat(mapNode *yaml.Node, key string, value float64)`
+* `SetScalarNull(mapNode *yaml.Node, key string)` → `!!null`
+
+> Behavior: If the key exists, we replace only the value token (preserving spacing and inline comment).
+> If it’s new, it’s appended at the mapping’s indent; strings are safely quoted on insertion.
+
+### Deletion (surgical)
+
+* `DeleteKey(mapNode *yaml.Node, key string)`
+  Removes **all occurrences** of the key under that mapping. Deletion uses pre‑indexed start/end byte boundaries to
+  remove the entire block (scalars, mappings, or arrays). If surgery isn’t possible, fallback marshal still removes the
+  key without churning unrelated lines.
+
+### JSON Patch (RFC‑6902)
+
+* `ApplyJSONPatchBytes(node *yaml.Node, patchJSON []byte) error`
+* `ApplyJSONPatch(node *yaml.Node, patch jsonpatch.Patch) error`
+* `ApplyJSONPatchAtPathBytes(node *yaml.Node, patchJSON []byte, basePath []string) error`
+* `ApplyJSONPatchAtPath(node *yaml.Node, patch jsonpatch.Patch, basePath []string) error`
+
+**Notes**
+
+* `basePath` lets you interpret each op’s pointer **relative** to a mapping path (e.g. `[]string{"service","envs"}`).
+* Arrays: targeted edits (`/0/property`, `/-` appends) often remain **surgical**. Whole‑array replaces may fall back.
+
+**Example: replace a field inside an array item (single‑line diff)**
 
 ```go
-package main
-
-import (
-    "fmt"
-    "os"
-    "github.com/kevinwang15/yamledit"
-)
-
-func main() {
-    // Read your YAML file
-    data, _ := os.ReadFile("config.yaml")
-
-    // Parse YAML
-    doc, err := yamledit.Parse(data)
-    if err != nil {
-        panic(err)
-    }
-
-    // Navigate to nested paths (creates if missing)
-    settings := yamledit.EnsurePath(doc, "app", "settings")
-
-    // Set values while preserving comments & formatting
-    yamledit.SetScalarInt(settings, "port", 8080)
-    yamledit.SetScalarInt(settings, "timeout", 30)
-
-    // Marshal back to YAML (byte-surgical where possible)
-    output, _ := yamledit.Marshal(doc)
-
-    // Write back to file
-    if err := os.WriteFile("config.yaml", output, 0o644); err != nil {
-        panic(err)
-    }
-
-    fmt.Println("Updated config.yaml")
-}
+patch := []byte(`[{"op":"replace","path":"/0/property","value":"target-new"}]`)
+if err := yamledit.ApplyJSONPatchAtPathBytes(doc, patch, []string{"service", "externalSecretEnvs"}); err != nil { /* ... */ }
+out, _ := yamledit.Marshal(doc)
 ```
 
-## Example
+**Example: append a new array item**
 
-Input YAML:
-
-```yaml
-# Application config
-app:
-  name: myapp
-  # Settings section
-  settings:
-    debug: false  # Debug mode
+```go
+patch := []byte(`[{"op":"add","path":"/-","value":{"name":"EXTRA","path":"data/shared","property":"extra"}}]`)
+_ = yamledit.ApplyJSONPatchAtPathBytes(doc, patch, []string{"service", "externalSecretEnvs"})
+out, _ := yamledit.Marshal(doc)
 ```
 
-After running the code above:
+---
 
-```yaml
-# Application config
-app:
-  name: myapp
-  # Settings section
-  settings:
-    debug: false  # Debug mode
-    port: 8080
-    timeout: 30
-```
+## Guarantees & design choices
 
-**Notice how:**
+* **Comments preserved.** Header, foot, and inline (`# ...`) comments are preserved; unrelated lines are byte‑stable.
+* **Indent preserved.** Base indent auto‑detected (2/3/4/…); indentless sequences supported; new content matches
+  original style.
+* **Key order preserved.** Original order is maintained; **new keys are appended** to their mapping.
+* **Duplicates deduped on write.** If the original contained duplicate keys, only the **last** occurrence remains after
+  marshal (YAML semantics: last wins). This changes bytes but not meaning.
+* **Booleans normalize on edit.** A key you edit with `SetScalarBool` (or via JSON Patch) will render as bare `true`/
+  `false` even if previously quoted. Unrelated booleans remain untouched.
 
-* All comments are preserved.
-* Original indentation is maintained (including 2/3/4-space and indentless sequences).
-* New keys are appended without disrupting structure.
-* Unrelated lines (including their quoting style) are unchanged.
+---
 
-## Behavior & Limitations
+## Arrays (sequences)
 
-* **Top-level must be a mapping.** `Parse` returns an error otherwise.
-* **Supported write ops:** setting integers and creating nested mappings (`EnsurePath`).
-  (String/boolean setters may be added in the future; today, only integers are mutated.)
-* **Duplicate keys:** **undefined behavior** (subject to change). Do not rely on how duplicates are handled.
-* **Fallbacks:** On shape changes or when surgery is unsafe, `Marshal` falls back to a structured re-encode that still preserves comments, order, and indent.
+* **Arrays of mappings**
 
-## Tests
+    * In‑place updates (e.g. change `property` of item `0`) are typically **single‑line** surgical diffs.
+    * Appends render using the item’s captured style:
 
-The test suite includes cases for:
+      ```
+      - name: FOO
+        path: ...
+        property: ...
+      ```
+* **Arrays of scalars**
 
-* Preserving single/double quotes on unrelated lines.
-* Keeping inline comments when updating integers.
-* Ensuring only the edited line changes when possible.
-* Appending new integer keys with the mapping’s original indent.
-* Fallback on shape change (scalar → mapping) without churning unrelated lines.
-* Preserving indentless sequences and the final newline.
+    * Index‑based replacements can be surgical.
+    * **Whole‑array replace** may fall back and can drop inter‑item comments. If you need minimal diffs & comment
+      preservation, prefer targeted index edits and `/-` appends instead of replacing the entire list.
+
+---
+
+## Testing
+
+The suite covers:
+
+* quote preservation (single/double), inline comments, final newline,
+* exact indent (2/3/4‑space, indentless),
+* new key insertion & append order,
+* JSON Patch on scalars, maps, arrays,
+* duplicate removal, deletions (including arrays),
+* concurrency safety.
 
 Run:
 
@@ -152,9 +216,12 @@ Run:
 go test ./...
 ```
 
-## Requirements
+## Performance
 
-* Go 1.21 or higher
+Edits run in O(changes), indexing is O(file). Memory footprint scales with the size of the original buffer and indices 
+(line offsets, map/sequence metadata).
+
+---
 
 ## License
 
