@@ -42,11 +42,21 @@ type docState struct {
 	// Also stores scalar sequence items keyed by path + [index].
 	valueOccByPathKey map[string][]valueOcc
 
+	// Full-byte spans for each mapping key’s block (key line through last line of its value),
+	// for *all* value kinds (scalar, mapping, sequence). One entry per occurrence to handle dups.
+	keyBlockOccByPathKey map[string][]blockSpan
+
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
 
 	// explicit deletions requested (path\0key)
 	toDelete    map[string]struct{}
 	arraysDirty bool // set only when JSON Patch mutates arrays (seq nodes)
+}
+
+// byte span for deleting a whole "key: <value>" block safely
+type blockSpan struct {
+	start int // offset of beginning of the key's line
+	end   int // offset of '\n' ending the last line that belongs to the value block (or EOF-1)
 }
 
 // Information about a sequence under a mapping path in the original YAML.
@@ -180,18 +190,19 @@ func Parse(data []byte) (*yaml.Node, error) {
 
 	// Build shadow state using goccy/go-yaml (to preserve comments and ordered map for fallback)
 	st := &docState{
-		doc:               doc,
-		comments:          gyaml.CommentMap{},
-		ordered:           gyaml.MapSlice{},
-		subPathByHN:       map[*yaml.Node][]string{},
-		indent:            2,
-		indentSeq:         true,
-		original:          append([]byte(nil), data...),
-		lineOffsets:       buildLineOffsets(data),
-		mapIndex:          map[string]*mapInfo{},
-		valueOccByPathKey: map[string][]valueOcc{},
-		seqIndex:          map[string]*seqInfo{},
-		toDelete:          map[string]struct{}{},
+		doc:                  doc,
+		comments:             gyaml.CommentMap{},
+		ordered:              gyaml.MapSlice{},
+		subPathByHN:          map[*yaml.Node][]string{},
+		indent:               2,
+		indentSeq:            true,
+		original:             append([]byte(nil), data...),
+		lineOffsets:          buildLineOffsets(data),
+		mapIndex:             map[string]*mapInfo{},
+		valueOccByPathKey:    map[string][]valueOcc{},
+		keyBlockOccByPathKey: map[string][]blockSpan{},
+		seqIndex:             map[string]*seqInfo{},
+		toDelete:             map[string]struct{}{},
 	}
 
 	// Decode into ordered map and capture comments; detect indent and sequence style
@@ -525,6 +536,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	original := st.original
 	mapIdx := cloneMapIndex(st.mapIndex)
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
+	blkIdx := cloneBlockSpanIndex(st.keyBlockOccByPathKey)
 	origOrdered := cloneMapSlice(st.origOrdered)
 	delSet := make(map[string]struct{}, len(st.toDelete))
 	seqIdx := cloneSeqIndex(st.seqIndex)
@@ -535,7 +547,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	st.mu.RUnlock()
 
 	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, delSet)
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, blkIdx, seqIdx, indent, delSet)
 	if okPatch {
 		// clear the flag if we succeeded surgically
 		if arraysDirty {
@@ -1260,6 +1272,7 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			continue
 		}
 		key := k.Value
+		pk := makePathKey(cur, key)
 
 		if k.Column > 0 && mi.indent == 0 && !(len(cur) == 0 && k.Column-1 == 0) {
 			// Record indent from the first seen key (except the very top where 0 is valid)
@@ -1280,7 +1293,6 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 				valEnd := findScalarEndOnLine(st.original, valStart)
 				lineEnd := findLineEnd(st.original, valStart)
 
-				pk := makePathKey(cur, key)
 				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
 					keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
 					valStart:     valStart,
@@ -1298,6 +1310,37 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			// If valStart is invalid (e.g. empty value), still mark that key exists.
 			mi.hasAnyKey = true
 		}
+
+		// record the full deletion span for this key/value block ---
+		// start = beginning of the key's line
+		keyStart := lineStartOffset(st.lineOffsets, k.Line)
+		blockEnd := findLineEnd(st.original, keyStart) // fallback
+		switch v.Kind {
+		case yaml.ScalarNode:
+			if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		case yaml.MappingNode:
+			childPath := append(cur, key)
+			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > 0 {
+				blockEnd = childMi.lastLineEnd
+			} else if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		case yaml.SequenceNode:
+			seqPath := append(cur, key)
+			if si := st.seqIndex[joinPath(seqPath)]; si != nil && si.hasAnyItem && si.lastItemEnd > 0 {
+				blockEnd = si.lastItemEnd
+			} else if valStart >= 0 && valStart < len(st.original) {
+				// covers empty-inline [] or an empty block where the value token is on the same line
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		default:
+			if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		}
+		st.keyBlockOccByPathKey[pk] = append(st.keyBlockOccByPathKey[pk], blockSpan{start: keyStart, end: blockEnd})
 
 		// Recurse for nested mapping and extend the parent's lastLineEnd to the child's end.
 		if v.Kind == yaml.MappingNode {
@@ -1341,6 +1384,7 @@ func marshalBySurgery(
 	originalOrdered gyaml.MapSlice,
 	mapIdx map[string]*mapInfo,
 	valIdx map[string][]valueOcc,
+	blkIdx map[string][]blockSpan,
 	seqIdx map[string]*seqInfo,
 	baseIndent int,
 	deletions map[string]struct{},
@@ -1421,7 +1465,7 @@ func marshalBySurgery(
 		}
 
 		// 4) Explicit deletions (remove all occurrences)
-		delOK, delPatches := buildDeletionPatches(original, deletions, valIdx)
+		delOK, delPatches := buildDeletionPatches(original, deletions, valIdx, blkIdx)
 		if !delOK {
 			return nil, false
 		}
@@ -2696,26 +2740,40 @@ func buildInsertPatches(
 }
 
 // explicit deletion patches for requested keys (remove whole lines for ALL occurrences)
-func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx map[string][]valueOcc) (bool, []patch) {
+func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx map[string][]valueOcc, blkIdx map[string][]blockSpan) (bool, []patch) {
 	if len(deletions) == 0 {
 		return true, nil
 	}
 	var patches []patch
 	for pk := range deletions {
 		occs := valIdx[pk]
-		if len(occs) == 0 {
-			// Key didn’t exist in original as a scalar line → no surgical deletion to make.
-			// Not an error: fallback encoder will already have removed from the logical map.
+		if len(occs) > 0 {
+			// scalar deletions: remove each occurrence line
+			for _, o := range occs {
+				start := o.keyLineStart
+				end := o.lineEnd
+				if end < len(original) && original[end] == '\n' {
+					end++
+				}
+				patches = append(patches, patch{start: start, end: end, data: []byte{}})
+			}
 			continue
 		}
-		for _, o := range occs {
-			start := o.keyLineStart
-			end := o.lineEnd
-			if end < len(original) && original[end] == '\n' {
-				end++
+		// non-scalar (mapping/sequence/inline) → delete full block span(s)
+		if spans := blkIdx[pk]; len(spans) > 0 {
+			for _, sp := range spans {
+				start := sp.start
+				end := sp.end
+				if end < len(original) && original[end] == '\n' {
+					end++
+				}
+				// Sanity
+				if start >= 0 && end >= start && end <= len(original) {
+					patches = append(patches, patch{start: start, end: end, data: []byte{}})
+				}
 			}
-			patches = append(patches, patch{start: start, end: end, data: []byte{}})
 		}
+
 	}
 	return true, patches
 }
@@ -2767,6 +2825,16 @@ func cloneValueIndex(in map[string][]valueOcc) map[string][]valueOcc {
 	out := make(map[string][]valueOcc, len(in))
 	for k, v := range in {
 		cp := make([]valueOcc, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+func cloneBlockSpanIndex(in map[string][]blockSpan) map[string][]blockSpan {
+	out := make(map[string][]blockSpan, len(in))
+	for k, v := range in {
+		cp := make([]blockSpan, len(v))
 		copy(cp, v)
 		out[k] = cp
 	}
