@@ -42,6 +42,9 @@ type docState struct {
 	// Also stores scalar sequence items keyed by path + [index].
 	valueOccByPathKey map[string][]valueOcc
 
+	// Key-Value boundaries for all types (scalar, mapping, sequence) for surgical deletion.
+	boundsByPathKey map[string][]kvBounds
+
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
 
 	// explicit deletions requested (path\0key)
@@ -54,6 +57,12 @@ type seqItemInfo struct {
 	name  string // identity: value of "name" key if mapping, or scalar value itself (for fallback matching)
 	start int    // byte offset at the beginning of the item's first line ("- " ...)
 	end   int    // byte offset of the newline ending the last line of the item
+}
+
+// Boundaries of a "key: value" block for deletion.
+type kvBounds struct {
+	start int // start offset of the line where the key begins (keyLineStart)
+	end   int // exclusive end offset of the block (includes trailing newline if present)
 }
 
 type seqInfo struct {
@@ -87,6 +96,16 @@ func cloneSeqIndex(in map[string]*seqInfo) map[string]*seqInfo {
 			}
 		}
 		out[k] = &cp
+	}
+	return out
+}
+
+func cloneBoundsIndex(in map[string][]kvBounds) map[string][]kvBounds {
+	out := make(map[string][]kvBounds, len(in))
+	for k, v := range in {
+		cp := make([]kvBounds, len(v))
+		copy(cp, v)
+		out[k] = cp
 	}
 	return out
 }
@@ -190,6 +209,7 @@ func Parse(data []byte) (*yaml.Node, error) {
 		lineOffsets:       buildLineOffsets(data),
 		mapIndex:          map[string]*mapInfo{},
 		valueOccByPathKey: map[string][]valueOcc{},
+		boundsByPathKey:   map[string][]kvBounds{}, // Initialize new map
 		seqIndex:          map[string]*seqInfo{},
 		toDelete:          map[string]struct{}{},
 	}
@@ -525,6 +545,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	original := st.original
 	mapIdx := cloneMapIndex(st.mapIndex)
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
+	boundsIdx := cloneBoundsIndex(st.boundsByPathKey) // Clone new index
 	origOrdered := cloneMapSlice(st.origOrdered)
 	delSet := make(map[string]struct{}, len(st.toDelete))
 	seqIdx := cloneSeqIndex(st.seqIndex)
@@ -535,7 +556,8 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	st.mu.RUnlock()
 
 	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, indent, delSet)
+	// MODIFIED: Pass boundsIdx
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, indent, delSet)
 	if okPatch {
 		// clear the flag if we succeeded surgically
 		if arraysDirty {
@@ -1240,6 +1262,7 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 
 // ----- Byte indices from original parse -----
 
+// indexPositions populates indices for surgical edits: mapIndex, valueOccByPathKey, seqIndex, and boundsByPathKey.
 func indexPositions(st *docState, n *yaml.Node, cur []string) {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return
@@ -1260,6 +1283,7 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			continue
 		}
 		key := k.Value
+		pk := makePathKey(cur, key)
 
 		if k.Column > 0 && mi.indent == 0 && !(len(cur) == 0 && k.Column-1 == 0) {
 			// Record indent from the first seen key (except the very top where 0 is valid)
@@ -1270,55 +1294,85 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			mi.indent = 0
 		}
 
-		// For scalars, we can anchor at the value line.
+		// --- Boundary Calculation (Generalized) ---
+
+		keyLineStart := lineStartOffset(st.lineOffsets, k.Line)
 		valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
-		// We restrict indexing in valueOccByPathKey to scalars, as replacement logic relies on it.
-		// We still update anchoring (lastLineEnd, hasAnyKey) for all kinds if valStart is valid.
+
+		// Initialize lineEnd which tracks the end of the structure for this key (index of \n or EOF-1).
+		var lineEnd int
+
+		// Initialize boundaries and track if key exists.
 		if valStart >= 0 && valStart < len(st.original) {
-
-			if v.Kind == yaml.ScalarNode {
-				valEnd := findScalarEndOnLine(st.original, valStart)
-				lineEnd := findLineEnd(st.original, valStart)
-
-				pk := makePathKey(cur, key)
-				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
-					keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
-					valStart:     valStart,
-					valEnd:       valEnd,
-					lineEnd:      lineEnd,
-				})
-
-				// Track last line in this mapping to attach future insertions
-				if lineEnd > mi.lastLineEnd {
-					mi.lastLineEnd = lineEnd
-				}
-			}
+			lineEnd = findLineEnd(st.original, valStart)
 			mi.hasAnyKey = true
 		} else {
-			// If valStart is invalid (e.g. empty value), still mark that key exists.
+			// Fallback if valStart is invalid (e.g. empty value or complex type starting on next line)
+			lineEnd = findLineEnd(st.original, keyLineStart)
 			mi.hasAnyKey = true
 		}
 
-		// Recurse for nested mapping and extend the parent's lastLineEnd to the child's end.
+		// Recurse and extend boundaries for complex types.
 		if v.Kind == yaml.MappingNode {
 			childPath := append(cur, key)
 			indexPositions(st, v, childPath)
-			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > mi.lastLineEnd {
-				mi.lastLineEnd = childMi.lastLineEnd
+			// Extend lineEnd if child mapping extends further.
+			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > lineEnd {
+				lineEnd = childMi.lastLineEnd
 			}
 		} else if v.Kind == yaml.SequenceNode {
 			seqPath := append(cur, key)
-			// Index scalars inside sequence items (if they are mappings).
+			// Index children (needed for replacement and anchors)
 			indexSeqPositions(st, v, seqPath)
-			// Index scalar items if it's a sequence of scalars.
 			indexScalarSeqPositions(st, v, seqPath)
-			// Capture anchors/indent for append surgery.
 			indexSequenceAnchors(st, v, seqPath)
 
-			// Update parent mapping's lastLineEnd if the sequence extends past it.
-			if seqInfo := st.seqIndex[joinPath(seqPath)]; seqInfo != nil && seqInfo.lastItemEnd > mi.lastLineEnd {
-				mi.lastLineEnd = seqInfo.lastItemEnd
+			// Extend lineEnd if sequence extends further.
+			if seqInfo := st.seqIndex[joinPath(seqPath)]; seqInfo != nil && seqInfo.lastItemEnd > lineEnd {
+				lineEnd = seqInfo.lastItemEnd
 			}
+		}
+
+		// --- Recording Indices ---
+
+		// 1. Record scalar occurrences for replacement (only if scalar).
+		if v.Kind == yaml.ScalarNode && valStart >= 0 && valStart < len(st.original) {
+			valEnd := findScalarEndOnLine(st.original, valStart)
+			// Use the specific line end for the scalar value itself for valueOcc
+			scalarLineEnd := findLineEnd(st.original, valStart)
+
+			st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
+				keyLineStart: keyLineStart,
+				valStart:     valStart,
+				valEnd:       valEnd,
+				lineEnd:      scalarLineEnd,
+			})
+		}
+
+		// 2. Record boundaries for deletion (all types).
+		// Use the potentially extended lineEnd for the block boundary.
+		blockEnd := lineEnd
+		// findLineEnd returns index of '\n' or len(b)-1.
+		// Calculate exclusive end offset.
+		if blockEnd >= 0 {
+			if blockEnd < len(st.original) && st.original[blockEnd] == '\n' {
+				blockEnd++ // Include the newline
+			} else if blockEnd == len(st.original)-1 {
+				blockEnd = len(st.original) // EOF case
+			}
+		}
+
+		// Safety check before recording bounds.
+		if keyLineStart >= 0 && keyLineStart <= len(st.original) && blockEnd >= keyLineStart && blockEnd <= len(st.original) {
+			st.boundsByPathKey[pk] = append(st.boundsByPathKey[pk], kvBounds{
+				start: keyLineStart,
+				end:   blockEnd,
+			})
+		}
+
+		// 3. Update parent mapping's lastLineEnd (used for insertions).
+		if lineEnd > mi.lastLineEnd {
+			mi.lastLineEnd = lineEnd
 		}
 	}
 }
@@ -1342,6 +1396,7 @@ func marshalBySurgery(
 	mapIdx map[string]*mapInfo,
 	valIdx map[string][]valueOcc,
 	seqIdx map[string]*seqInfo,
+	boundsIdx map[string][]kvBounds, // NEW argument
 	baseIndent int,
 	deletions map[string]struct{},
 ) ([]byte, bool) {
@@ -1387,7 +1442,8 @@ func marshalBySurgery(
 		}
 
 		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion
-		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, current, valIdx, deletions, replacedSeqs)
+		// MODIFIED: Use boundsIdx instead of valIdx
+		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, boundsIdx, deletions, replacedSeqs)
 		if !dupPatchesOK {
 			return nil, false
 		}
@@ -1421,7 +1477,8 @@ func marshalBySurgery(
 		}
 
 		// 4) Explicit deletions (remove all occurrences)
-		delOK, delPatches := buildDeletionPatches(original, deletions, valIdx)
+		// MODIFIED: Use boundsIdx instead of valIdx
+		delOK, delPatches := buildDeletionPatches(original, deletions, boundsIdx)
 		if !delOK {
 			return nil, false
 		}
@@ -2033,34 +2090,37 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 
 // Ignore duplicate-removal for keys that are explicitly deleted in this op (to avoid overlap).
 // Also skip duplicates under sequences we fully replaced.
-func buildDuplicateRemovalPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, ignore map[string]struct{}, skipSeq map[string]struct{}) (bool, []patch) {
+func buildDuplicateRemovalPatches(original []byte, boundsIdx map[string][]kvBounds, ignore map[string]struct{}, skipSeq map[string]struct{}) (bool, []patch) {
 	var patches []patch
-	// For each path+key that had duplicates originally, remove all but the last line
+	// For each path+key that had duplicates originally, remove all but the last occurrence
 outer:
-	for pk, occs := range valIdx {
+	for pk, boundsList := range boundsIdx {
 		if _, skip := ignore[pk]; skip {
 			continue
 		}
 		// Skip any pk under a replaced sequence (prefix: "<seqPath>\x00[")
+		// This applies to duplicates inside array items (which are indexed this way).
 		for sp := range skipSeq {
 			prefix := sp + pathSep + "["
 			if strings.HasPrefix(pk, prefix) {
 				continue outer
 			}
 		}
-		if len(occs) <= 1 {
+		if len(boundsList) <= 1 {
 			continue
 		}
-		for i := 0; i < len(occs)-1; i++ {
-			o := occs[i]
-			// Delete the whole line (from line start to line end + 1)
-			start := o.keyLineStart
-			end := o.lineEnd
-			// If the file had a newline, include it in deletion so we don't leave blank lines
-			if end < len(original) && original[end] == '\n' {
-				end++
+		// Remove all but the last occurrence (which is the semantically winning one)
+		for i := 0; i < len(boundsList)-1; i++ {
+			b := boundsList[i]
+
+			// Sanity check boundaries
+			if b.start < 0 || b.end > len(original) || b.end < b.start {
+				// Invalid bounds recorded, cannot perform surgery safely.
+				return false, nil
 			}
-			patches = append(patches, patch{start: start, end: end, data: []byte{}})
+
+			// Delete the whole structure defined by the bounds
+			patches = append(patches, patch{start: b.start, end: b.end, data: []byte{}})
 		}
 	}
 	return true, patches
@@ -2695,26 +2755,27 @@ func buildInsertPatches(
 	return true, patches
 }
 
-// explicit deletion patches for requested keys (remove whole lines for ALL occurrences)
-func buildDeletionPatches(original []byte, deletions map[string]struct{}, valIdx map[string][]valueOcc) (bool, []patch) {
+// explicit deletion patches for requested keys (remove whole lines/blocks for ALL occurrences)
+func buildDeletionPatches(original []byte, deletions map[string]struct{}, boundsIdx map[string][]kvBounds) (bool, []patch) {
 	if len(deletions) == 0 {
 		return true, nil
 	}
 	var patches []patch
 	for pk := range deletions {
-		occs := valIdx[pk]
-		if len(occs) == 0 {
-			// Key didn’t exist in original as a scalar line → no surgical deletion to make.
+		bounds := boundsIdx[pk]
+		if len(bounds) == 0 {
+			// Key didn’t exist in original → no surgical deletion to make.
 			// Not an error: fallback encoder will already have removed from the logical map.
 			continue
 		}
-		for _, o := range occs {
-			start := o.keyLineStart
-			end := o.lineEnd
-			if end < len(original) && original[end] == '\n' {
-				end++
+		for _, b := range bounds {
+			// Sanity check boundaries.
+			if b.start < 0 || b.end > len(original) || b.end < b.start {
+				// Invalid boundary indexed, potentially unsafe surgery. Fallback.
+				return false, nil
 			}
-			patches = append(patches, patch{start: start, end: end, data: []byte{}})
+			// The kvBounds struct already defines the exact start and exclusive end of the block.
+			patches = append(patches, patch{start: b.start, end: b.end, data: []byte{}})
 		}
 	}
 	return true, patches
