@@ -1311,37 +1311,6 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			mi.hasAnyKey = true
 		}
 
-		// record the full deletion span for this key/value block ---
-		// start = beginning of the key's line
-		keyStart := lineStartOffset(st.lineOffsets, k.Line)
-		blockEnd := findLineEnd(st.original, keyStart) // fallback
-		switch v.Kind {
-		case yaml.ScalarNode:
-			if valStart >= 0 && valStart < len(st.original) {
-				blockEnd = findLineEnd(st.original, valStart)
-			}
-		case yaml.MappingNode:
-			childPath := append(cur, key)
-			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > 0 {
-				blockEnd = childMi.lastLineEnd
-			} else if valStart >= 0 && valStart < len(st.original) {
-				blockEnd = findLineEnd(st.original, valStart)
-			}
-		case yaml.SequenceNode:
-			seqPath := append(cur, key)
-			if si := st.seqIndex[joinPath(seqPath)]; si != nil && si.hasAnyItem && si.lastItemEnd > 0 {
-				blockEnd = si.lastItemEnd
-			} else if valStart >= 0 && valStart < len(st.original) {
-				// covers empty-inline [] or an empty block where the value token is on the same line
-				blockEnd = findLineEnd(st.original, valStart)
-			}
-		default:
-			if valStart >= 0 && valStart < len(st.original) {
-				blockEnd = findLineEnd(st.original, valStart)
-			}
-		}
-		st.keyBlockOccByPathKey[pk] = append(st.keyBlockOccByPathKey[pk], blockSpan{start: keyStart, end: blockEnd})
-
 		// Recurse for nested mapping and extend the parent's lastLineEnd to the child's end.
 		if v.Kind == yaml.MappingNode {
 			childPath := append(cur, key)
@@ -1363,6 +1332,36 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 				mi.lastLineEnd = seqInfo.lastItemEnd
 			}
 		}
+
+		// --- record the full deletion span for this key/value block ---
+		keyStart := lineStartOffset(st.lineOffsets, k.Line)
+		blockEnd := findLineEnd(st.original, keyStart) // safe fallback
+		switch v.Kind {
+		case yaml.ScalarNode:
+			if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		case yaml.MappingNode:
+			childPath := append(cur, key)
+			if childMi := st.mapIndex[joinPath(childPath)]; childMi != nil && childMi.lastLineEnd > 0 {
+				blockEnd = childMi.lastLineEnd
+			} else if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		case yaml.SequenceNode:
+			seqPath := append(cur, key)
+			if si := st.seqIndex[joinPath(seqPath)]; si != nil && si.hasAnyItem && si.lastItemEnd > 0 {
+				blockEnd = si.lastItemEnd
+			} else if valStart >= 0 && valStart < len(st.original) {
+				// covers inline [] or empty-block value on the key line
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		default:
+			if valStart >= 0 && valStart < len(st.original) {
+				blockEnd = findLineEnd(st.original, valStart)
+			}
+		}
+		st.keyBlockOccByPathKey[pk] = append(st.keyBlockOccByPathKey[pk], blockSpan{start: keyStart, end: blockEnd})
 	}
 }
 
