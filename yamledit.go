@@ -2912,21 +2912,29 @@ func findScalarEndOnLine(b []byte, pos int) int {
 		return pos
 	}
 	i := pos
-	// Determine line end
+	// Determine line end (inclusive index: '\n' or len(b)-1)
 	le := findLineEnd(b, pos)
-	if le < pos {
-		le = len(b)
+
+	// Calculate exclusive end of line content (scanLimit).
+	// If le points to '\n', scanLimit is le.
+	// If le points to last char (EOF), scanLimit is le + 1 (len(b)).
+
+	// Since pos < len(b), we know len(b) > 0 and le is a valid index.
+
+	scanLimit := le
+	// If the character at le is NOT '\n', it must be the EOF case (last char).
+	if b[le] != '\n' {
+		scanLimit = le + 1
 	}
+
 	// If quoted
 	if b[i] == '\'' {
 		i++ // after opening '
-		for i <= le {
-			if i == le { // hit end of line
-				return le
-			}
+		// Use scanLimit (exclusive)
+		for i < scanLimit {
 			if b[i] == '\'' {
 				// YAML single quotes escape as ''
-				if i+1 <= le && b[i+1] == '\'' {
+				if i+1 < scanLimit && b[i+1] == '\'' {
 					i += 2
 					continue
 				}
@@ -2934,15 +2942,12 @@ func findScalarEndOnLine(b []byte, pos int) int {
 			}
 			i++
 		}
-		return le
+		return scanLimit // Unterminated quote ends at end of line.
 	}
 	if b[i] == '"' {
 		i++ // after opening "
 		esc := false
-		for i <= le {
-			if i == le {
-				return le
-			}
+		for i < scanLimit {
 			if esc {
 				esc = false
 				i++
@@ -2958,12 +2963,12 @@ func findScalarEndOnLine(b []byte, pos int) int {
 			}
 			i++
 		}
-		return le
+		return scanLimit
 	}
 
-	// Bare token: read until comment or newline
+	// Bare token: read until comment or newline (scanLimit)
 	j := pos
-	for j < le {
+	for j < scanLimit {
 		if b[j] == '#' {
 			break
 		}
