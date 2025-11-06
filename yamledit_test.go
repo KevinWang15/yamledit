@@ -2964,3 +2964,69 @@ func TestDeleteKey_PreservesInlineCommentWhitespace2(t *testing.T) {
 		}
 	}
 }
+
+// TestNoTrailingNewlineCharacterDuplication reproduces a bug where Parse + Marshal
+// duplicates the last character when the input YAML has no trailing newline.
+//
+// Bug: When input ends without '\n', the last character gets duplicated:
+//
+//	Input:  "property: SOME_PASSWORD" (no trailing newline, ends with 'D')
+//	Output: "property: SOME_PASSWORDD" (extra 'D' appended!)
+//
+// This causes git diffs to show unintended modifications to the last line.
+func TestNoTrailingNewlineCharacterDuplication(t *testing.T) {
+	// YAML WITHOUT trailing newline - last char is 'D' from PASSWORD
+	yamlWithoutNewline := []byte(`service:
+  envs:
+    FOO: bar
+  externalSecretEnvs:
+    - name: SECRET_A
+      path: secret/path/a
+      property: SOME_PASSWORD`)
+
+	// Verify no trailing newline
+	if len(yamlWithoutNewline) > 0 && yamlWithoutNewline[len(yamlWithoutNewline)-1] == '\n' {
+		t.Fatalf("Test setup error: input should not have trailing newline")
+	}
+	lastChar := yamlWithoutNewline[len(yamlWithoutNewline)-1]
+	t.Logf("Input size: %d bytes, last char: %q", len(yamlWithoutNewline), lastChar)
+
+	// Parse the YAML
+	doc, err := Parse(yamlWithoutNewline)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Add a new field (e.g., replicas: 2) to the service node
+	serviceNode := EnsurePath(doc, "service")
+	SetScalarInt(serviceNode, "replicas", 2)
+
+	// Marshal back
+	output, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	outputStr := string(output)
+	t.Logf("Output YAML:\n%s", outputStr)
+
+	// BUG CHECK: Verify the last character is NOT duplicated
+	buggyText := "property: SOME_PASSWORD" + string(lastChar) // Would be "SOME_PASSWORDD"
+	if strings.Contains(outputStr, buggyText) {
+		t.Errorf("BUG REPRODUCED: Last character %q was duplicated!", lastChar)
+		t.Errorf("Expected: 'property: SOME_PASSWORD'")
+		t.Errorf("Found:    'property: SOME_PASSWORD%c'", lastChar)
+		t.Errorf("This causes git diff to incorrectly show the last line as modified")
+	}
+
+	// Verify the new field was added
+	if !strings.Contains(outputStr, "replicas: 2") {
+		t.Errorf("Expected 'replicas: 2' to be added")
+	}
+
+	// Verify YAML is valid
+	var check map[string]any
+	if err := yaml.Unmarshal(output, &check); err != nil {
+		t.Errorf("Output is not valid YAML: %v", err)
+	}
+}
