@@ -1,0 +1,78 @@
+package yamledit
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+)
+
+func TestReproMapReplacementCorruption(t *testing.T) {
+	// This input simulates the structure where a map (envs) is followed by a list (externalSecretEnvs).
+	// The indentation levels are key here.
+	input := `java-service:
+  envs:
+    OLD_KEY: old_val
+  externalSecretEnvs:
+    - name: SECRET_1
+      path: secret/path/1
+    - name: SECRET_2
+      path: secret/path/2
+`
+
+	// Payload to replace 'envs' with.
+	// We add enough keys to change the size significantly.
+	newEnvs := map[string]string{
+		"NEW_KEY_1": "val1",
+		"NEW_KEY_2": "val2",
+		"NEW_KEY_3": "val3",
+		"NEW_KEY_4": "val4",
+		"NEW_KEY_5": "val5",
+	}
+	
+	mapJSON, err := json.Marshal(newEnvs)
+	require.NoError(t, err)
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	// Target path: /java-service/envs
+	path := []string{"java-service", "envs"}
+
+	// Construct a JSON Patch to REPLACE the 'envs' node
+	type patchOp struct {
+		Op    string          `json:"op"`
+		Path  string          `json:"path"`
+		Value json.RawMessage `json:"value,omitempty"`
+	}
+	ops := []patchOp{{Op: "replace", Path: "", Value: json.RawMessage(mapJSON)}}
+	payload, _ := json.Marshal(ops)
+
+	// Apply the patch
+	err = ApplyJSONPatchAtPathBytes(doc, payload, path)
+	require.NoError(t, err)
+
+	// Marshal back to YAML
+	output, err := Marshal(doc)
+	require.NoError(t, err)
+
+	t.Logf("Output YAML:\n%s", string(output))
+
+	// Validation: The output should be valid YAML
+	var data map[string]any
+	err = yaml.Unmarshal(output, &data)
+	assert.NoError(t, err, "Resulting YAML should be valid")
+
+	// Validation: Check if externalSecretEnvs is intact
+	js, ok := data["java-service"].(map[string]any)
+	require.True(t, ok)
+	
+	_, hasSecrets := js["externalSecretEnvs"]
+	assert.True(t, hasSecrets, "externalSecretEnvs should still exist")
+	
+	secrets, isList := js["externalSecretEnvs"].([]any)
+	assert.True(t, isList, "externalSecretEnvs should be a list")
+	assert.Equal(t, 2, len(secrets), "externalSecretEnvs should have 2 items")
+}
