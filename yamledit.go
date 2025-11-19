@@ -2594,7 +2594,7 @@ func buildInsertPatches(
 	}
 	collect(originalOrdered, nil)
 
-	// Walk current and insert new ints at the end of their mapping
+	// Walk current and insert new scalars at the end of their mapping
 	var walk func(ms gyaml.MapSlice, path []string) bool
 	walk = func(ms gyaml.MapSlice, path []string) bool {
 		mpath := joinPath(path)
@@ -2628,14 +2628,15 @@ func buildInsertPatches(
 					if insertPos < 0 || insertPos > len(original) {
 						return false
 					}
+					// If the anchor line had no trailing newline (EOF case), ensure the new key
+					// starts on a new line. NOTE: we *do not* update mi.lastLineEnd here; all
+					// insert positions are expressed in the original coordinate space.
 					if mi.lastLineEnd >= 0 {
 						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
 							line = "\n" + line
 						}
 					}
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
-					mi.lastLineEnd = insertPos + len(line) - 1
-					mapIdx[mpath] = mi
 				}
 			case string:
 				if _, existed := origKeys[mpath][k]; !existed {
@@ -2653,18 +2654,12 @@ func buildInsertPatches(
 					if insertPos < 0 || insertPos > len(original) {
 						return false
 					}
-
-					// If the anchor line had no trailing newline (EOF case), ensure the new key starts on a new line.
 					if mi.lastLineEnd >= 0 {
 						if mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n' {
 							line = "\n" + line
 						}
 					}
-
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
-					// Advance the local anchor so multiple insertions chain in order
-					mi.lastLineEnd = insertPos + len(line) - 1
-					mapIdx[mpath] = mi
 				}
 			case bool:
 				if _, existed := origKeys[mpath][k]; !existed {
@@ -2691,8 +2686,6 @@ func buildInsertPatches(
 						}
 					}
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
-					mi.lastLineEnd = insertPos + len(line) - 1
-					mapIdx[mpath] = mi
 				}
 			case float64:
 				if _, existed := origKeys[mpath][k]; !existed {
@@ -2716,8 +2709,6 @@ func buildInsertPatches(
 						}
 					}
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
-					mi.lastLineEnd = insertPos + len(line) - 1
-					mapIdx[mpath] = mi
 				}
 			case nil:
 				if _, existed := origKeys[mpath][k]; !existed {
@@ -2740,8 +2731,6 @@ func buildInsertPatches(
 						}
 					}
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
-					mi.lastLineEnd = insertPos + len(line) - 1
-					mapIdx[mpath] = mi
 				}
 			default:
 				continue
