@@ -1450,7 +1450,7 @@ func marshalBySurgery(
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
 		//    including inside arrays of mappings. (Scalar arrays handled above now).
-		replaceOK, replPatches := buildReplacementPatches(original, current, valIdx, seqIdx, replacedSeqs)
+		replaceOK, replPatches := buildReplacementPatches(original, current, originalOrdered, valIdx, seqIdx, replacedSeqs)
 		if !replaceOK {
 			return nil, false
 		}
@@ -1830,7 +1830,82 @@ func buildSeqAppendPatches(
 
 // buildReplacementPatches emits surgical scalar replacements (including inside seq items).
 // If a sequence at some path was fully replaced, skip emitting replacements for its items.
-func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map[string][]valueOcc, seqIdx map[string]*seqInfo, skipSeq map[string]struct{}) (bool, []patch) {
+func buildReplacementPatches(
+	original []byte,
+	current gyaml.MapSlice,
+	originalOrdered gyaml.MapSlice,
+	valIdx map[string][]valueOcc,
+	seqIdx map[string]*seqInfo,
+	skipSeq map[string]struct{},
+) (bool, []patch) {
+	// Helper: get original string value for (path, key) from originalOrdered.
+	// path is a slice of mapping keys and possibly "[idx]" segments for array items.
+	isIndexSeg := func(s string) bool {
+		return len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']'
+	}
+
+	lookupOrigString := func(path []string, key string) (string, bool) {
+		var recur func(cur interface{}, depth int) (interface{}, bool)
+		recur = func(cur interface{}, depth int) (interface{}, bool) {
+			if depth == len(path) {
+				switch m := cur.(type) {
+				case gyaml.MapSlice:
+					for i := len(m) - 1; i >= 0; i-- {
+						if keyEquals(m[i].Key, key) {
+							return m[i].Value, true
+						}
+					}
+				case map[string]interface{}:
+					if v, ok := m[key]; ok {
+						return v, true
+					}
+				}
+				return nil, false
+			}
+
+			seg := path[depth]
+			if isIndexSeg(seg) {
+				// "[N]" → array index
+				idxStr := seg[1 : len(seg)-1]
+				idx, err := strconv.Atoi(idxStr)
+				if err != nil {
+					return nil, false
+				}
+				switch arr := cur.(type) {
+				case []interface{}:
+					if idx < 0 || idx >= len(arr) {
+						return nil, false
+					}
+					return recur(arr[idx], depth+1)
+				default:
+					return nil, false
+				}
+			}
+
+			// mapping segment
+			switch m := cur.(type) {
+			case gyaml.MapSlice:
+				for _, it := range m {
+					if keyEquals(it.Key, seg) {
+						return recur(it.Value, depth+1)
+					}
+				}
+			case map[string]interface{}:
+				if v, ok := m[seg]; ok {
+					return recur(v, depth+1)
+				}
+			}
+			return nil, false
+		}
+
+		if v, ok := recur(originalOrdered, 0); ok {
+			if s, ok2 := v.(string); ok2 {
+				return s, true
+			}
+		}
+		return "", false
+	}
+
 	var patches []patch
 
 	// For sequence items, coalesce multiple scalar changes down to ONE patch,
@@ -1841,7 +1916,7 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 	}
 	perItem := map[string][]keyPatch{} // itemPath ("a\0b\0[1]") -> changed keys/patches
 
-	isIndexSeg := func(s string) bool {
+	isIndexSeg = func(s string) bool {
 		return len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']'
 	}
 
@@ -1965,6 +2040,23 @@ func buildReplacementPatches(original []byte, current gyaml.MapSlice, valIdx map
 				}
 				last := occs[len(occs)-1]
 				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
+
+				// --- Block scalar handling (| / >) ---
+				// If the scalar is represented in the YAML as a block scalar, we treat the
+				// whole block as opaque for surgery:
+				//   • If the logical value hasn't changed, leave bytes exactly as-is.
+				//   • If the value DID change, we cannot safely patch → abort surgery
+				//     and let Marshal() fall back to structured encode.
+				if len(oldTok) > 0 && (oldTok[0] == '|' || oldTok[0] == '>') {
+					if orig, ok := lookupOrigString(path, k); ok && orig == v {
+						// Value is identical → keep block scalar bytes untouched.
+						continue
+					}
+					// Underlying value changed for a block scalar (or we couldn't
+					// find the original value). We can't do safe byte-surgery here.
+					return false
+				}
+
 				newTok := stringReplacementToken(oldTok, v)
 				// Avoid churn if identical bytes
 				if bytes.Equal(oldTok, newTok) {
@@ -4278,13 +4370,10 @@ func seqItemNames(seq *yaml.Node) ([]string, bool) {
 
 // extendScalarBlockEnd walks forward from the scalar's line and includes
 // any following lines that are part of the same scalar block.
-// A continuation line is:
-//   - blank, or
-//   - more-indented than the key's indent.
+// A continuation line is blank, or more-indented than the key's indent.
 func extendScalarBlockEnd(b []byte, lineOffsets []int, scalarLine int, keyIndent int) int {
-	// scalarLine is 1-based; convert to index in lineOffsets
 	lastEnd := findLineEnd(b, lineStartOffset(lineOffsets, scalarLine))
-	// walk subsequent lines
+
 	for li := scalarLine + 1; li <= len(lineOffsets); li++ {
 		start := lineStartOffset(lineOffsets, li)
 		if start >= len(b) {
@@ -4294,17 +4383,17 @@ func extendScalarBlockEnd(b []byte, lineOffsets []int, scalarLine int, keyIndent
 		line := b[start:end]
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 {
-			// blank line is considered part of the block
+			// blank line → still part of block
 			lastEnd = end
 			continue
 		}
 		indent := leadingSpaces(line)
 		if indent > keyIndent {
-			// still part of this scalar block
+			// more-indented than key → still part of this scalar block
 			lastEnd = end
 			continue
 		}
-		// indentation not greater than key indent ⇒ new sibling key / mapping
+		// indentation <= keyIndent → new sibling key / mapping
 		break
 	}
 	return lastEnd
