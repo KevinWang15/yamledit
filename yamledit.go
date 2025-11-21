@@ -48,8 +48,9 @@ type docState struct {
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
 
 	// explicit deletions requested (path\0key)
-	toDelete    map[string]struct{}
-	arraysDirty bool // set only when JSON Patch mutates arrays (seq nodes)
+	toDelete        map[string]struct{}
+	arraysDirty     bool // set only when JSON Patch mutates arrays (seq nodes)
+	structuralDirty bool // when true, skip surgery and fall back to full encode
 }
 
 // Information about a sequence under a mapping path in the original YAML.
@@ -175,6 +176,80 @@ func lookup(doc *yaml.Node) (*docState, bool) {
 	return st, ok
 }
 
+// normalizeEmptyEnvMap converts "envs:" (parsed as !!null) into an empty mapping
+// in the yaml.v3 AST and in the ordered logical view, and marks the doc as
+// structurally dirty so Marshal() will fall back to a full re-encode.
+//
+// This fixes cases like:
+//
+//	app-chart:
+//	  envs:
+//
+// …which should render as:
+//
+//	app-chart:
+//	  envs: {}
+func normalizeEmptyEnvMap(doc *yaml.Node, st *docState) {
+	if doc == nil || st == nil {
+		return
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return
+	}
+	root := doc.Content[0]
+	if root == nil || root.Kind != yaml.MappingNode {
+		return
+	}
+
+	var walk func(n *yaml.Node, path []string)
+	walk = func(n *yaml.Node, path []string) {
+		if n == nil {
+			return
+		}
+		switch n.Kind {
+		case yaml.MappingNode:
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				k := n.Content[i]
+				v := n.Content[i+1]
+				if k.Kind != yaml.ScalarNode {
+					continue
+				}
+				key := k.Value
+				if key == "envs" && v.Kind == yaml.ScalarNode && v.Tag == "!!null" {
+					// Replace scalar null with an empty !!map in the AST.
+					m := &yaml.Node{
+						Kind:        yaml.MappingNode,
+						Tag:         "!!map",
+						HeadComment: v.HeadComment,
+						LineComment: v.LineComment,
+						FootComment: v.FootComment,
+						Anchor:      v.Anchor,
+						Line:        v.Line,
+						Column:      v.Column,
+					}
+					n.Content[i+1] = m
+					// Update the logical ordered view: envs becomes an empty map.
+					st.ordered = setAnyAtPath(st.ordered, path, key, gyaml.MapSlice{})
+					st.structuralDirty = true
+					continue
+				}
+				// Recurse into children so we catch nested envs maps as well.
+				switch v.Kind {
+				case yaml.MappingNode:
+					walk(v, append(path, key))
+				case yaml.SequenceNode:
+					walk(v, append(path, key))
+				}
+			}
+		case yaml.SequenceNode:
+			for _, c := range n.Content {
+				walk(c, path)
+			}
+		}
+	}
+	walk(root, nil)
+}
+
 // --------------------------------------------------------------------------------------
 // Public API
 // --------------------------------------------------------------------------------------
@@ -224,6 +299,13 @@ func Parse(data []byte) (*yaml.Node, error) {
 
 	// Keep a snapshot of the original ordered map for diffing
 	st.origOrdered = cloneMapSlice(st.ordered)
+
+	// Normalize pathological shapes (e.g. "envs:" parsed as !!null) into an
+	// empty mapping in the AST and logical view. This is marked as a structural
+	// change so Marshal() will fall back to full encode, producing "envs: {}".
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
+		normalizeEmptyEnvMap(doc, st)
+	}
 
 	// Index mapping handles (for path lookups later on)
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
@@ -553,21 +635,26 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		delSet[k] = struct{}{}
 	}
 	arraysDirty := st.arraysDirty
+	structuralDirty := st.structuralDirty
 	st.mu.RUnlock()
 
-	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
-	// MODIFIED: Pass boundsIdx
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, indent, delSet)
-	if okPatch {
-		// clear the flag if we succeeded surgically
-		if arraysDirty {
-			if s, ok := lookup(doc); ok {
-				s.mu.Lock()
-				s.arraysDirty = false
-				s.mu.Unlock()
+	// If we know the structure has changed in ways that byte surgery can't
+	// safely represent (e.g. "envs:" -> "envs: {}"), skip surgery and fall
+	// back to a full yaml.v3 encode.
+	if !structuralDirty {
+		// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
+		out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, indent, delSet)
+		if okPatch {
+			// clear the flag if we succeeded surgically
+			if arraysDirty {
+				if s, ok := lookup(doc); ok {
+					s.mu.Lock()
+					s.arraysDirty = false
+					s.mu.Unlock()
+				}
 			}
+			return out, nil
 		}
-		return out, nil
 	}
 
 	// Fallback: structured encode (still preserves comments/order/indent)
@@ -3374,17 +3461,47 @@ func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
 	for k, ov := range om {
 		cv, ok := cm[k]
 		if !ok {
+			// key was removed entirely; we don't treat that as a shape change here
+			// because DeleteKey is handled surgically via boundsByPathKey.
 			continue
 		}
-		_, oIsMap := ov.(gyaml.MapSlice)
-		_, cIsMap := cv.(gyaml.MapSlice)
-		if oIsMap != cIsMap {
-			return true
-		}
-		if oIsMap && cIsMap {
-			if hasShapeChange(ov.(gyaml.MapSlice), cv.(gyaml.MapSlice)) {
+
+		// Mapping vs non-mapping transitions (scalar -> map, map -> scalar)
+		if oMap, okMap := ov.(gyaml.MapSlice); okMap {
+			cMap, cOk := cv.(gyaml.MapSlice)
+			if !cOk {
 				return true
 			}
+			// Non-empty -> empty (or vice versa) mapping is a structural change
+			// that surgery can't represent cleanly (we want "envs: {}" etc.).
+			if (len(oMap) == 0) != (len(cMap) == 0) {
+				return true
+			}
+			if len(oMap) > 0 && len(cMap) > 0 {
+				if hasShapeChange(oMap, cMap) {
+					return true
+				}
+			}
+			continue
+		} else if _, cIsMap := cv.(gyaml.MapSlice); cIsMap {
+			// scalar/sequence -> map
+			return true
+		}
+
+		// Sequence transitions
+		oSlice, oIsSlice := ov.([]interface{})
+		cSlice, cIsSlice := cv.([]interface{})
+		if oIsSlice && cIsSlice {
+			// We treat "non-empty -> empty" as a structural change; this is
+			// what drives fallback for cases like deleting all array items and
+			// wanting "externalSecretEnvs: []".
+			if len(oSlice) > 0 && len(cSlice) == 0 {
+				return true
+			}
+			continue
+		}
+		if oIsSlice != cIsSlice {
+			return true
 		}
 	}
 	return false
