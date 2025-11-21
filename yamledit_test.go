@@ -3030,3 +3030,39 @@ func TestNoTrailingNewlineCharacterDuplication(t *testing.T) {
 		t.Errorf("Output is not valid YAML: %v", err)
 	}
 }
+
+// deleting a folded scalar currently leaves dangling lines that break YAML parsing.
+func TestDeleteKey_FoldedScalarLeavesValidYaml(t *testing.T) {
+	input := []byte(`app:
+  envs:
+    FOLDED_VALUE: >
+      line-one,
+      line-two
+    KEEP_ME: "ok"
+`)
+
+	doc, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	envs := EnsurePath(doc, "app", "envs")
+	DeleteKey(envs, "FOLDED_VALUE")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("YAML became invalid after DeleteKey: %v\ncontent:\n%s", err, string(out))
+	}
+	if strings.Contains(string(out), "FOLDED_VALUE") {
+		t.Fatalf("folded key should be removed:\n%s", string(out))
+	}
+	envsMap, _ := parsed["app"].(map[string]any)["envs"].(map[string]any)
+	if _, ok := envsMap["KEEP_ME"]; !ok {
+		t.Fatalf("KEEP_ME should remain, got: %v", envsMap)
+	}
+}

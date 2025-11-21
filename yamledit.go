@@ -1312,6 +1312,25 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 			mi.hasAnyKey = true
 		}
 
+		// If this is a scalar value, check if it is a block/folded/ literal scalar,
+		// and if so, extend the block end to include all its continuation lines.
+		if v.Kind == yaml.ScalarNode && valStart >= 0 && valStart < len(st.original) {
+			// YAML block scalars use style '|' or '>' or may span multiple lines.
+			// We can robustly detect them by checking that the scalar starts
+			// with '|' or '>' token (as in "key: |" or "key: >").
+			if valStart < len(st.original) {
+				ch := st.original[valStart]
+				if ch == '|' || ch == '>' {
+					// keyIndent is the indent of the key line (k.Column-1).
+					keyIndent := 0
+					if k.Column > 0 {
+						keyIndent = k.Column - 1
+					}
+					lineEnd = extendScalarBlockEnd(st.original, st.lineOffsets, v.Line, keyIndent)
+				}
+			}
+		}
+
 		// Recurse and extend boundaries for complex types.
 		if v.Kind == yaml.MappingNode {
 			childPath := append(cur, key)
@@ -4255,4 +4274,38 @@ func seqItemNames(seq *yaml.Node) ([]string, bool) {
 		}
 	}
 	return out, true
+}
+
+// extendScalarBlockEnd walks forward from the scalar's line and includes
+// any following lines that are part of the same scalar block.
+// A continuation line is:
+//   - blank, or
+//   - more-indented than the key's indent.
+func extendScalarBlockEnd(b []byte, lineOffsets []int, scalarLine int, keyIndent int) int {
+	// scalarLine is 1-based; convert to index in lineOffsets
+	lastEnd := findLineEnd(b, lineStartOffset(lineOffsets, scalarLine))
+	// walk subsequent lines
+	for li := scalarLine + 1; li <= len(lineOffsets); li++ {
+		start := lineStartOffset(lineOffsets, li)
+		if start >= len(b) {
+			break
+		}
+		end := findLineEnd(b, start)
+		line := b[start:end]
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			// blank line is considered part of the block
+			lastEnd = end
+			continue
+		}
+		indent := leadingSpaces(line)
+		if indent > keyIndent {
+			// still part of this scalar block
+			lastEnd = end
+			continue
+		}
+		// indentation not greater than key indent ⇒ new sibling key / mapping
+		break
+	}
+	return lastEnd
 }
