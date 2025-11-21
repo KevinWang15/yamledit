@@ -1770,7 +1770,10 @@ func buildSeqAppendPatches(
 				}
 				origArr, ok := getArrAtPath(originalOrdered, path, k)
 				if !ok {
-					return false
+					// This is a brand-new sequence (no original anchor). We don't try
+					// to surgically append into it here; insertion of the entire key
+					// will be handled (or not) by buildInsertPatches.
+					continue
 				}
 				olen, nlen := len(origArr), len(v)
 				if nlen < olen {
@@ -2821,6 +2824,142 @@ func buildInsertPatches(
 					}
 					patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(line)})
 				}
+			case []interface{}:
+				// New sequence key?
+				if _, existed := origKeys[mpath][k]; existed {
+					// If the key already existed in the original, we don't handle
+					// it as a "new key" insertion. Apps/changes to its items are
+					// handled via the sequence surgery helpers.
+					continue
+				}
+
+				mi := mapIdx[mpath]
+				if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+					// No stable anchor inside this mapping to attach the new block.
+					// We can't safely insert bytes here → bail out to fallback.
+					return false
+				}
+
+				// Compute indent for the key line
+				indent := mi.indent
+				if indent == 0 && len(path) > 0 {
+					indent = baseIndent * len(path)
+				}
+
+				var sb strings.Builder
+
+				// Key line: "  externalSecretEnvs:\n"
+				sb.WriteString(strings.Repeat(" ", indent))
+				sb.WriteString(k)
+				sb.WriteString(":\n")
+
+				// Indentation for "- ..." lines and nested keys.
+				// We can use the library-wide baseIndent as the step.
+				seqIndent := indent + baseIndent       // for "- ..."
+				itemKVIndent := seqIndent + baseIndent // for "name:", "path:", ...
+
+				renderScalar := func(v interface{}) string {
+					switch vv := v.(type) {
+					case int:
+						return fmt.Sprintf("%d", vv)
+					case float64:
+						return strconv.FormatFloat(vv, 'g', -1, 64)
+					case bool:
+						if vv {
+							return "true"
+						}
+						return "false"
+					case string:
+						if isSafeBareString(vv) {
+							return vv
+						}
+						return quoteNewStringToken(vv)
+					case nil:
+						return "null"
+					default:
+						s := fmt.Sprint(vv)
+						if isSafeBareString(s) {
+							return s
+						}
+						return quoteNewStringToken(s)
+					}
+				}
+
+				for _, el := range v {
+					switch item := el.(type) {
+					case gyaml.MapSlice:
+						if len(item) == 0 {
+							// "- {}" style (unlikely here, but safe)
+							sb.WriteString(strings.Repeat(" ", seqIndent))
+							sb.WriteString("- {}\n")
+							continue
+						}
+
+						// Inline the first field: "- name: S"
+						firstKey := ""
+						firstVal := interface{}(nil)
+						for _, kv := range item {
+							if ks, ok := kv.Key.(string); ok {
+								firstKey = ks
+								firstVal = kv.Value
+								break
+							}
+						}
+						if firstKey == "" {
+							// fallback: scalar-ish toString
+							sb.WriteString(strings.Repeat(" ", seqIndent))
+							sb.WriteString("- ")
+							sb.WriteString(renderScalar(item))
+							sb.WriteString("\n")
+							continue
+						}
+
+						sb.WriteString(strings.Repeat(" ", seqIndent))
+						sb.WriteString("- ")
+						sb.WriteString(firstKey)
+						sb.WriteString(": ")
+						sb.WriteString(renderScalar(firstVal))
+						sb.WriteString("\n")
+
+						// Remaining fields on their own lines
+						for _, kv := range item {
+							ks, ok := kv.Key.(string)
+							if !ok || ks == firstKey {
+								continue
+							}
+							sb.WriteString(strings.Repeat(" ", itemKVIndent))
+							sb.WriteString(ks)
+							sb.WriteString(": ")
+							sb.WriteString(renderScalar(kv.Value))
+							sb.WriteString("\n")
+						}
+
+					default:
+						// Scalar array item: "- 8080", "- 'foo'" etc.
+						sb.WriteString(strings.Repeat(" ", seqIndent))
+						sb.WriteString("- ")
+						sb.WriteString(renderScalar(el))
+						sb.WriteString("\n")
+					}
+				}
+
+				insertPos := mi.lastLineEnd + 1
+				if insertPos < 0 || insertPos > len(original) {
+					return false
+				}
+
+				// If the last key had no trailing newline, make sure we start on a new line.
+				line := sb.String()
+				if mi.lastLineEnd >= 0 && (mi.lastLineEnd >= len(original) || original[mi.lastLineEnd] != '\n') {
+					line = "\n" + line
+				}
+
+				patches = append(patches, patch{
+					start: insertPos,
+					end:   insertPos,
+					data:  []byte(line),
+				})
+
 			case nil:
 				if _, existed := origKeys[mpath][k]; !existed {
 					mi := mapIdx[mpath]
