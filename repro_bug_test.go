@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"strings"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
@@ -114,4 +116,58 @@ func TestFoldedScalarPreservedWhenAddingSiblingSequence(t *testing.T) {
 
 	var round map[string]any
 	require.NoError(t, yaml.Unmarshal(out, &round), "output should remain valid YAML")
+}
+
+func TestDeletingAllEnvKeysLeavesEmptyMap(t *testing.T) {
+	input := `app-chart:
+  cpu: 100
+  envs:
+    KAFKA_CDC_TOPIC: topic
+    REGION: HK
+  externalSecretEnvs:
+    - name: A
+      path: p1
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	envs := EnsurePath(doc, "app-chart", "envs")
+	for _, k := range []string{
+		"KAFKA_CDC_TOPIC",
+		"REGION",
+	} {
+		DeleteKey(envs, k)
+	}
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+
+	appChart, ok := parsed["app-chart"].(map[string]any)
+	require.True(t, ok, "app-chart should be a map")
+
+	envsVal, hasEnvs := appChart["envs"]
+	require.True(t, hasEnvs, "envs key should remain present")
+	if envsVal == nil {
+		t.Fatalf("envs rendered as null/bare key; expected empty map. YAML:\n%s", s)
+	}
+
+	envsMap, ok := envsVal.(map[string]any)
+	if !ok {
+		t.Fatalf("envs should remain a mapping (empty map), got %T (%v)", envsVal, envsVal)
+	}
+	if len(envsMap) != 0 {
+		t.Fatalf("envs should be empty after deleting all children; got %v", envsMap)
+	}
+
+	if strings.Contains(s, "envs:\n  externalSecretEnvs") {
+		t.Fatalf("envs rendered as bare key with no value (invalid/ambiguous YAML):\n%s", s)
+	}
+	if !strings.Contains(s, "envs: {}") {
+		t.Fatalf("expected YAML to render envs as empty mapping (envs: {}), got:\n%s", s)
+	}
 }
