@@ -171,3 +171,167 @@ func TestDeletingAllEnvKeysLeavesEmptyMap(t *testing.T) {
 		t.Fatalf("expected YAML to render envs as empty mapping (envs: {}), got:\n%s", s)
 	}
 }
+
+func TestRemovingAllArrayItemsLeavesEmptyArray(t *testing.T) {
+	input := `app-chart:
+  envs:
+    REGION: HK
+  externalSecretEnvs:
+    - name: A
+      path: p1
+    - name: B
+      path: p2
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	patch := []byte(`[
+		{"op":"remove","path":"/0"},
+		{"op":"remove","path":"/0"}
+	]`)
+	err = ApplyJSONPatchAtPathBytes(doc, patch, []string{"app-chart", "externalSecretEnvs"})
+	require.NoError(t, err)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+
+	appChart, ok := parsed["app-chart"].(map[string]any)
+	require.True(t, ok)
+
+	arrVal, hasArr := appChart["externalSecretEnvs"]
+	require.True(t, hasArr, "externalSecretEnvs should remain present")
+	if arrVal == nil {
+		t.Fatalf("externalSecretEnvs rendered as null/bare key; expected empty array. YAML:\n%s", s)
+	}
+	arr, ok := arrVal.([]any)
+	if !ok {
+		t.Fatalf("externalSecretEnvs should remain a sequence (empty array), got %T (%v)", arrVal, arrVal)
+	}
+	if len(arr) != 0 {
+		t.Fatalf("externalSecretEnvs should be empty after deleting all items; got %v", arr)
+	}
+	if strings.Contains(s, "externalSecretEnvs:\n  envs:") || strings.Contains(s, "externalSecretEnvs:\n  ") {
+		t.Fatalf("externalSecretEnvs rendered as bare key with no value:\n%s", s)
+	}
+	if !strings.Contains(s, "externalSecretEnvs: []") {
+		t.Fatalf("expected YAML to render externalSecretEnvs as empty array (externalSecretEnvs: []), got:\n%s", s)
+	}
+}
+
+func TestEmptyMapThenDeleteSiblingSequenceDoesNotBecomeNull(t *testing.T) {
+	input := `app-chart:
+  envs:
+    A: 1
+    B: 2
+  externalSecretEnvs:
+    - name: A
+      path: p1
+    - name: B
+      path: p2
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	envs := EnsurePath(doc, "app-chart", "envs")
+	DeleteKey(envs, "A")
+	DeleteKey(envs, "B")
+
+	app := EnsurePath(doc, "app-chart")
+	DeleteKey(app, "externalSecretEnvs")
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	appChart, ok := parsed["app-chart"].(map[string]any)
+	require.True(t, ok)
+
+	envsVal, hasEnvs := appChart["envs"]
+	require.True(t, hasEnvs, "envs key should remain present")
+	if envsVal == nil {
+		t.Fatalf("envs became null after deleting sibling sequence; expected empty map. YAML:\n%s", s)
+	}
+	envsMap, ok := envsVal.(map[string]any)
+	if !ok {
+		t.Fatalf("envs should be a map, got %T (%v)", envsVal, envsVal)
+	}
+	if len(envsMap) != 0 {
+		t.Fatalf("envs should be empty, got %v", envsMap)
+	}
+	if strings.Contains(s, "envs:\n") && !strings.Contains(s, "envs: {}") {
+		t.Fatalf("envs rendered as bare key instead of empty map:\n%s", s)
+	}
+	if strings.Contains(s, "envs: null") {
+		t.Fatalf("envs became null after deleting sibling sequence:\n%s", s)
+	}
+	if strings.Contains(s, "externalSecretEnvs") {
+		t.Fatalf("externalSecretEnvs should be deleted:\n%s", s)
+	}
+}
+
+func TestEmptyEnvMapRoundTripDoesNotBecomeNull(t *testing.T) {
+	input := `app-chart:
+  envs:
+    A: 1
+    B: 2
+  externalSecretEnvs:
+    - name: A
+      path: p1
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	envs := EnsurePath(doc, "app-chart", "envs")
+	DeleteKey(envs, "A")
+	DeleteKey(envs, "B")
+	app := EnsurePath(doc, "app-chart")
+	DeleteKey(app, "externalSecretEnvs")
+
+	first, err := Marshal(doc)
+	require.NoError(t, err)
+	s1 := string(first)
+	if strings.Contains(s1, "envs:\n") && !strings.Contains(s1, "envs: {}") {
+		t.Fatalf("first marshal rendered bare envs key instead of empty map:\n%s", s1)
+	}
+
+	// Round-trip through Parse → Marshal (simulates a second run) should not turn envs into null.
+	doc2, err := Parse(first)
+	require.NoError(t, err)
+	second, err := Marshal(doc2)
+	require.NoError(t, err)
+	s2 := string(second)
+	if strings.Contains(s2, "envs: null") || strings.Contains(s2, "envs:\n") {
+		t.Fatalf("empty envs map turned into null/bare after round-trip:\nFIRST:\n%s\nSECOND:\n%s", s1, s2)
+	}
+	if !strings.Contains(s2, "envs: {}") {
+		t.Fatalf("expected envs to remain empty map after round-trip; got:\n%s", s2)
+	}
+}
+
+func TestEmptyEnvMapDoesNotSerializeAsNull(t *testing.T) {
+	input := `app-chart:
+  envs:
+`
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	if strings.Contains(s, "envs:null") || strings.Contains(s, "envs: null") {
+		t.Fatalf("empty env map serialized as null (envs:null):\n%s", s)
+	}
+	if !strings.Contains(s, "envs: {}") {
+		t.Fatalf("expected empty env map to render as envs: {}, got:\n%s", s)
+	}
+}
