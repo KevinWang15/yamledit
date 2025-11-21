@@ -3066,3 +3066,32 @@ func TestDeleteKey_FoldedScalarLeavesValidYaml(t *testing.T) {
 		t.Fatalf("KEEP_ME should remain, got: %v", envsMap)
 	}
 }
+
+// adding an unrelated key leaves dangling lines that break YAML parsing.
+func TestAddUnrelatedKey_FoldedScalarLeavesValidYaml(t *testing.T) {
+	input := []byte(`app:
+  envs:
+    FOLDED_VALUE: >
+      line-one,
+      line-two
+    KEEP_ME: "ok"
+`)
+
+	doc, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	envs := EnsurePath(doc, "app", "envs")
+	SetScalarString(envs, "NEW_VALUE", "new")
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("YAML became invalid after DeleteKey: %v\ncontent:\n%s", err, string(out))
+	}
+}
