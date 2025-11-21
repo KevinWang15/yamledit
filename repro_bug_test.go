@@ -31,7 +31,7 @@ func TestReproMapReplacementCorruption(t *testing.T) {
 		"NEW_KEY_4": "val4",
 		"NEW_KEY_5": "val5",
 	}
-	
+
 	mapJSON, err := json.Marshal(newEnvs)
 	require.NoError(t, err)
 
@@ -68,11 +68,50 @@ func TestReproMapReplacementCorruption(t *testing.T) {
 	// Validation: Check if externalSecretEnvs is intact
 	js, ok := data["java-service"].(map[string]any)
 	require.True(t, ok)
-	
+
 	_, hasSecrets := js["externalSecretEnvs"]
 	assert.True(t, hasSecrets, "externalSecretEnvs should still exist")
-	
+
 	secrets, isList := js["externalSecretEnvs"].([]any)
 	assert.True(t, isList, "externalSecretEnvs should be a list")
 	assert.Equal(t, 2, len(secrets), "externalSecretEnvs should have 2 items")
+}
+
+func TestFoldedScalarPreservedWhenAddingSiblingSequence(t *testing.T) {
+	input := `app-chart:
+  envs:
+    FOO: >
+        line1
+        line2
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	patch := []byte(`[
+		{"op":"add","path":"/externalSecretEnvs","value":[{"name":"S","path":"S"}]}
+	]`)
+	err = ApplyJSONPatchAtPathBytes(doc, patch, []string{"app-chart"})
+	require.NoError(t, err)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+
+	expected := `app-chart:
+  envs:
+    FOO: >
+        line1
+        line2
+  externalSecretEnvs:
+    - name: S
+      path: S
+`
+
+	if string(out) == string(input) {
+		t.Fatalf("no change produced; test input should gain an externalSecretEnvs block")
+	}
+	assert.Equal(t, expected, string(out), "folded scalar should keep its line breaks when adding a sibling array")
+
+	var round map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &round), "output should remain valid YAML")
 }
