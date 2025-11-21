@@ -335,3 +335,118 @@ func TestEmptyEnvMapDoesNotSerializeAsNull(t *testing.T) {
 		t.Fatalf("expected empty env map to render as envs: {}, got:\n%s", s)
 	}
 }
+
+func TestCommentBetweenKeysDiscardedWhenAllChildrenDeleted(t *testing.T) {
+	input := `app-chart:
+  envs:
+    FOO: foo
+    # note
+    BAR: bar
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	envs := EnsurePath(doc, "app-chart", "envs")
+	DeleteKey(envs, "FOO")
+	DeleteKey(envs, "BAR")
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	// No stray comment left behind; envs should be an explicit empty map.
+	if strings.Contains(s, "# note") {
+		t.Fatalf("comment between deleted keys should be dropped when map becomes empty:\n%s", s)
+	}
+	if !strings.Contains(s, "envs: {}") {
+		t.Fatalf("expected envs to render as empty map after deletions; got:\n%s", s)
+	}
+}
+
+func TestArrayOfObjectsKeepsInnerCommentOnUpdate(t *testing.T) {
+	input := `items:
+  - name: A
+    # inside
+    value: 1
+  - name: B
+    value: 2
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	patch := []byte(`[
+		{"op":"replace","path":"/0/value","value":10}
+	]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"items"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	if !strings.Contains(s, "# inside") {
+		t.Fatalf("comment inside array item was lost on update:\n%s", s)
+	}
+	if !strings.Contains(s, "value: 10") {
+		t.Fatalf("updated value missing:\n%s", s)
+	}
+}
+
+func TestArrayOfObjectsDropsInnerCommentWhenItemDeleted(t *testing.T) {
+	input := `items:
+  - name: A
+    # inside
+    value: 1
+  - name: B
+    value: 2
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	patch := []byte(`[
+		{"op":"remove","path":"/0"}
+	]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"items"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	if strings.Contains(s, "# inside") {
+		t.Fatalf("comment belonging to deleted array item should not linger:\n%s", s)
+	}
+	if !strings.Contains(s, "- name: B") {
+		t.Fatalf("remaining item missing:\n%s", s)
+	}
+}
+
+func TestScalarArrayKeepsInlineCommentsOnReplace(t *testing.T) {
+	input := `list:
+  - one # a
+  - two # b
+  - three # c
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	patch := []byte(`[
+		{"op":"replace","path":"/1","value":"TWO"}
+	]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"list"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	// Inline comments on untouched lines should remain
+	if !strings.Contains(s, "one # a") || !strings.Contains(s, "three # c") {
+		t.Fatalf("inline comments on untouched scalars lost:\n%s", s)
+	}
+	// Changed line keeps its comment
+	if !strings.Contains(s, "TWO # b") {
+		t.Fatalf("inline comment on replaced scalar lost:\n%s", s)
+	}
+}
