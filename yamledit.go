@@ -2620,6 +2620,27 @@ func buildSeqReplaceBlockPatches(
 				O := len(origArr)
 				seqPath := append(append([]string{}, path...), k)
 
+				// Build map of original item info by identity for preservation logic.
+				type origItemContext struct {
+					index int
+					info  seqItemInfo
+					data  interface{} // The logical data (gyaml.MapSlice or scalar)
+				}
+				// Store a list of contexts for each identity to handle potential duplicates.
+				origItemsByIdentity := make(map[string][]origItemContext)
+
+				// Populate the map, ensuring we have the necessary info from seqInfo (si).
+				// We rely on si.items having the correct length and names captured during indexing.
+				if len(si.items) == O {
+					for i := 0; i < O; i++ {
+						identity := si.items[i].name
+						if identity != "" {
+							ctx := origItemContext{index: i, info: si.items[i], data: origArr[i]}
+							origItemsByIdentity[identity] = append(origItemsByIdentity[identity], ctx)
+						}
+					}
+				}
+
 				// Build "pre-gap" map for fallback rendering if surgery isn't possible for an item.
 				preGap := map[string][]byte{}
 				if len(si.items) >= 2 && len(si.gaps) == len(si.items)-1 {
@@ -2651,7 +2672,57 @@ func buildSeqReplaceBlockPatches(
 
 				// Render new block
 				var sb strings.Builder
+				// Keep track of used original items by index.
+				usedOriginalItems := make(map[int]bool)
+
 				for i, el := range v {
+
+					// Preservation Logic for Existing, Unchanged Items (Identity-Based).
+					// If an item existed and hasn't changed content, reuse its original bytes to prevent churn.
+					identity := getItemIdentity(el)
+					if identity != "" {
+						// Check if there are available original occurrences for this identity.
+						if contexts, found := origItemsByIdentity[identity]; found && len(contexts) > 0 {
+							// Try to find an unused context that matches the content.
+							foundMatch := false
+							for _, ctx := range contexts {
+								if !usedOriginalItems[ctx.index] {
+									// Check if the logical content is identical (order-independent for maps).
+									if reflect.DeepEqual(toPlain(ctx.data), toPlain(el)) {
+										// Found an unused, identical original item. Reuse original bytes.
+
+										// 1. Preserve preceding Gap using preGap map.
+										// preGap stores the gap for the first occurrence of an identity.
+										if g, ok := preGap[identity]; ok && len(g) > 0 {
+											sb.Write(g)
+											// Consume gap if used (only once per identity).
+											delete(preGap, identity)
+										}
+
+										// 2. Write the original item bytes.
+										start := ctx.info.start
+										// ctx.info.end points to the newline char or EOF-1. Add 1 to include it.
+										end := ctx.info.end + 1
+										if end > len(original) {
+											end = len(original)
+										}
+
+										// Boundary checks
+										if start >= 0 && end >= start && end <= len(original) {
+											sb.Write(original[start:end])
+											usedOriginalItems[ctx.index] = true
+											foundMatch = true
+											break // Found a match, move to the next item in the new array.
+										}
+									}
+								}
+							}
+							if foundMatch {
+								continue // Done: preserved original bytes.
+							}
+						}
+					}
+					// END NEW Preservation Logic.
 
 					// --- Hybrid Surgical Replacement (Index Alignment) ---
 					// Try surgical replacement if the index existed originally AND the item is still a scalar.
