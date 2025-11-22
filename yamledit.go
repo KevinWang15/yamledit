@@ -2724,6 +2724,17 @@ func buildSeqReplaceBlockPatches(
 					}
 					// END NEW Preservation Logic.
 
+					// NEW: For *appended* items (indexes >= original length), make sure
+					// they start on a fresh line. Some preserved items' spans may not
+					// include a trailing newline, which would otherwise cause the next
+					// "- path: ..." to be glued onto the last line.
+					if i >= O && sb.Len() > 0 {
+						s := sb.String()
+						if len(s) > 0 && s[len(s)-1] != '\n' {
+							sb.WriteByte('\n')
+						}
+					}
+
 					// --- Hybrid Surgical Replacement (Index Alignment) ---
 					// Try surgical replacement if the index existed originally AND the item is still a scalar.
 					if i < O && i < len(si.items) {
