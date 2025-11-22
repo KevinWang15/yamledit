@@ -79,6 +79,54 @@ func TestReproMapReplacementCorruption(t *testing.T) {
 	assert.Equal(t, 2, len(secrets), "externalSecretEnvs should have 2 items")
 }
 
+// Regression: replacing an array (records accessor style) should not rewrite
+// existing items when appending a new one. Currently this produces a diff with
+// removals/rewrites (field order churn + misplaced comments).
+func TestArrayReplaceAppendDoesNotChurnExistingItems(t *testing.T) {
+	original := `app-chart:
+  externalSecretEnvs:
+    - path: path/alpha
+      property: SECRET_ALPHA
+      name: KEY_ALPHA
+    - name: KEY_BETA
+      property: SECRET_BETA
+      # intentionally missing path to mimic partial data
+    # region separator between clusters
+    - name: KEY_GAMMA
+      property: SECRET_GAMMA
+      path: path/gamma
+`
+
+	doc, err := Parse([]byte(original))
+	require.NoError(t, err)
+
+	records := map[string]map[string]any{
+		"KEY_ALPHA": {"property": "SECRET_ALPHA", "path": "path/alpha"},
+		"KEY_BETA":  {"property": "SECRET_BETA"},
+		"KEY_GAMMA": {"property": "SECRET_GAMMA", "path": "path/gamma"},
+		// New item being appended
+		"NEW_KEY": {"property": "NEW_SECRET", "path": "path/new"},
+	}
+
+	order := extractArrayOrder(doc, []string{"app-chart", "externalSecretEnvs"}, "name")
+	arrayJSON, err := buildArrayJSON(records, order, "name", []string{"path", "property"})
+	require.NoError(t, err)
+
+	err = applySequencePatch(doc, []string{"app-chart", "externalSecretEnvs"}, "replace", arrayJSON)
+	require.NoError(t, err)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+
+	diff := unifiedDiff(original, string(out))
+	adds, removes := diffStats(diff)
+
+	// Ideal: only the new item's lines are added (no deletions).
+	if removes > 0 || adds > 6 { // allow a couple lines for blank/comment preservation
+		t.Fatalf("array replace churned existing items (+%d/-%d):\n%s", adds, removes, diff)
+	}
+}
+
 func TestFoldedScalarPreservedWhenAddingSiblingSequence(t *testing.T) {
 	input := `app-chart:
   envs:
