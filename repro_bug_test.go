@@ -498,3 +498,124 @@ func TestScalarArrayKeepsInlineCommentsOnReplace(t *testing.T) {
 		t.Fatalf("inline comment on replaced scalar lost:\n%s", s)
 	}
 }
+
+// TestNestedListsConvertedToStringsWhenAddingField reproduces a bug where
+// adding a new scalar field to a document corrupts nested list structures
+// by converting them to flow-style string representations.
+//
+// Bug: When document contains nested lists like:
+//   routes:
+//     - host: app.example.com
+//       paths:
+//         - /
+// And we add a scalar field (e.g., replicas: 5), yamledit converts the nested
+// paths list to a string:
+//   paths: '[/]'
+//
+// Expected behavior: Lists should remain as block-style lists after modification.
+func TestNestedListsConvertedToStringsWhenAddingField(t *testing.T) {
+	input := `service:
+  enabled: true
+  routes:
+    - host: app.example.com
+      paths:
+        - /
+    - host: api.example.com
+      paths:
+        - /api
+        - /v1
+`
+
+	doc, err := Parse([]byte(input))
+	require.NoError(t, err)
+
+	// Add a new scalar field "replicas: 5" to the service section
+	// This simulates the real-world scenario where adding replicas corrupts lists
+	serviceNode := EnsurePath(doc, "service")
+	SetScalarInt(serviceNode, "replicas", 5)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	s := string(out)
+
+	t.Logf("Output YAML:\n%s", s)
+
+	// BUG CHECK: Verify paths lists are NOT converted to string representations
+	if strings.Contains(s, "paths: '[/]'") || strings.Contains(s, `paths: "[/]"`) {
+		t.Errorf("BUG REPRODUCED: paths list was converted to string '[/]'!")
+		t.Errorf("Expected:\n  paths:\n    - /")
+		t.Errorf("Found: paths: '[/]' (incorrect flow-style string)")
+	}
+
+	if strings.Contains(s, "paths: '[/api, /v1]'") || strings.Contains(s, `paths: "[/api, /v1]"`) {
+		t.Errorf("BUG REPRODUCED: multi-item paths list was converted to string!")
+		t.Errorf("Expected:\n  paths:\n    - /api\n    - /v1")
+	}
+
+	// Verify the list structure is preserved (should contain "- /" or "- /api")
+	if !strings.Contains(s, "- /") {
+		t.Errorf("Expected paths to remain as block-style list with '- /' format")
+	}
+
+	// Verify replicas was added correctly
+	if !strings.Contains(s, "replicas: 5") {
+		t.Errorf("Expected 'replicas: 5' to be added")
+	}
+
+	// Verify the output is valid YAML with correct types
+	var parsed map[string]interface{}
+	err = yaml.Unmarshal(out, &parsed)
+	require.NoError(t, err, "Output should be valid YAML")
+
+	// Navigate to service
+	service, ok := parsed["service"].(map[string]interface{})
+	require.True(t, ok, "service should be a map")
+
+	// Verify replicas was set
+	replicas, ok := service["replicas"].(int)
+	require.True(t, ok, "replicas should be an int")
+	assert.Equal(t, 5, replicas, "replicas should be 5")
+
+	// Verify routes structure
+	routes, ok := service["routes"].([]interface{})
+	require.True(t, ok, "routes should be a list, got %T", service["routes"])
+	require.Greater(t, len(routes), 0, "routes should have at least one item")
+
+	// Verify first route has paths as a list (not string)
+	route1, ok := routes[0].(map[string]interface{})
+	require.True(t, ok, "route should be a map")
+
+	paths, ok := route1["paths"]
+	require.True(t, ok, "paths field should exist in route")
+
+	// This is the critical check - paths should be a list, not a string
+	pathsList, ok := paths.([]interface{})
+	if !ok {
+		t.Errorf("BUG CONFIRMED: paths is %T instead of []interface{}", paths)
+		t.Errorf("paths value: %v", paths)
+		t.Errorf("This means yamledit converted the list to a string representation")
+		t.FailNow()
+	}
+
+	require.Greater(t, len(pathsList), 0, "paths list should have items")
+	assert.Equal(t, "/", pathsList[0], "first path should be '/'")
+
+	// Verify second route with multiple paths
+	if len(routes) > 1 {
+		route2, ok := routes[1].(map[string]interface{})
+		require.True(t, ok, "second route should be a map")
+
+		paths2, ok := route2["paths"]
+		require.True(t, ok, "paths field should exist in second route")
+
+		pathsList2, ok := paths2.([]interface{})
+		if !ok {
+			t.Errorf("BUG CONFIRMED: second route paths is %T instead of []interface{}", paths2)
+			t.FailNow()
+		}
+
+		assert.Equal(t, 2, len(pathsList2), "second route should have 2 paths")
+		assert.Equal(t, "/api", pathsList2[0], "first path should be '/api'")
+		assert.Equal(t, "/v1", pathsList2[1], "second path should be '/v1'")
+	}
+}
