@@ -3027,7 +3027,9 @@ func buildInsertPatches(
 				seqIndent := indent + baseIndent       // for "- ..."
 				itemKVIndent := seqIndent + baseIndent // for "name:", "path:", ...
 
-				renderScalar := func(v interface{}) string {
+				// Declare renderScalar first so it can call itself recursively
+				var renderScalar func(interface{}) string
+				renderScalar = func(v interface{}) string {
 					switch vv := v.(type) {
 					case int:
 						return fmt.Sprintf("%d", vv)
@@ -3045,6 +3047,17 @@ func buildInsertPatches(
 						return quoteNewStringToken(vv)
 					case nil:
 						return "null"
+					case []interface{}:
+						// Handle nested arrays/sequences properly
+						// Render as flow-style YAML sequence: [item1, item2, ...]
+						if len(vv) == 0 {
+							return "[]"
+						}
+						var items []string
+						for _, item := range vv {
+							items = append(items, renderScalar(item))
+						}
+						return "[" + strings.Join(items, ", ") + "]"
 					default:
 						s := fmt.Sprint(vv)
 						if isSafeBareString(s) {
@@ -3580,10 +3593,56 @@ func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
 			if len(oSlice) > 0 && len(cSlice) == 0 {
 				return true
 			}
+			// Check if sequence contains nested sequences (deeply nested lists)
+			// If so, treat as shape change to avoid corruption during surgery
+			if hasNestedSequences(oSlice) || hasNestedSequences(cSlice) {
+				return true
+			}
 			continue
 		}
 		if oIsSlice != cIsSlice {
 			return true
+		}
+	}
+	return false
+}
+
+// hasNestedSequences checks if a slice contains nested sequences
+// (e.g., routes with paths arrays inside)
+func hasNestedSequences(slice []interface{}) bool {
+	for _, item := range slice {
+		switch v := item.(type) {
+		case []interface{}:
+			// Direct nested sequence
+			return true
+		case gyaml.MapSlice:
+			// Check if any value in the map is a sequence
+			for _, kv := range v {
+				if _, ok := kv.Value.([]interface{}); ok {
+					return true
+				}
+				// Recursively check nested maps
+				if nestedMap, ok := kv.Value.(gyaml.MapSlice); ok {
+					if hasNestedSequencesInMap(nestedMap) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasNestedSequencesInMap checks if a MapSlice contains any sequence values
+func hasNestedSequencesInMap(ms gyaml.MapSlice) bool {
+	for _, kv := range ms {
+		if _, ok := kv.Value.([]interface{}); ok {
+			return true
+		}
+		if nestedMap, ok := kv.Value.(gyaml.MapSlice); ok {
+			if hasNestedSequencesInMap(nestedMap) {
+				return true
+			}
 		}
 	}
 	return false
