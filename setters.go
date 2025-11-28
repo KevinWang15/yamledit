@@ -281,6 +281,10 @@ func DeleteKey(mapNode *yaml.Node, key string) {
 		return
 	}
 
+	if len(mapNode.Content) == 0 {
+		st.structuralDirty = true
+	}
+
 	// Ensure we have a path recorded for this handle
 	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil {
 		indexMappingHandles(st, docHN.Content[0], nil)

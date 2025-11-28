@@ -35,14 +35,10 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	structuralDirty := st.structuralDirty
 	st.mu.RUnlock()
 
-	// If we know the structure has changed in ways that byte surgery can't
-	// safely represent (e.g. "envs:" -> "envs: {}"), skip surgery and fall
-	// back to a full yaml.v3 encode.
+	// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
 	if !structuralDirty {
-		// Attempt byte-surgical patching first (even if arraysDirty), with enhanced seq support.
 		out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, indent, delSet)
 		if okPatch {
-			// clear the flag if we succeeded surgically
 			if arraysDirty {
 				if s, ok := lookup(doc); ok {
 					s.mu.Lock()
@@ -54,8 +50,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		}
 	}
 
-	// Fallback: structured encode (still preserves comments/order/indent)
-	// Fallback: encode from the yaml.v3 AST to preserve original quoting/comment styles
+	// Structured encode fallback (v2: isolated to cases we cannot safely patch)
 	var buf bytes.Buffer
 	encV3 := yaml.NewEncoder(&buf)
 	encV3.SetIndent(indent)

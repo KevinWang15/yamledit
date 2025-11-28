@@ -383,11 +383,6 @@ func hasShapeChange(originalOrdered, current gyaml.MapSlice) bool {
 			if !cOk {
 				return true
 			}
-			// Non-empty -> empty (or vice versa) mapping is a structural change
-			// that surgery can't represent cleanly (we want "envs: {}" etc.).
-			if (len(oMap) == 0) != (len(cMap) == 0) {
-				return true
-			}
 			if len(oMap) > 0 && len(cMap) > 0 {
 				if hasShapeChange(oMap, cMap) {
 					return true

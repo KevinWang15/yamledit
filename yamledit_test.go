@@ -3,6 +3,7 @@ package yamledit
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -1159,6 +1160,54 @@ func TestFinalNewlinePreserved(t *testing.T) {
 	}
 	if len(out) == 0 || out[len(out)-1] != '\n' {
 		t.Fatalf("final newline should be preserved; got bytes: %v", out)
+	}
+}
+
+func TestGoldenPreservesUnchangedBytes(t *testing.T) {
+	orig, err := os.ReadFile("golden_testdata.yaml")
+	require.NoError(t, err)
+
+	doc, err := Parse(orig)
+	require.NoError(t, err)
+
+	// mutate a value; unrelated lines should stay byte-identical
+	svc := EnsurePath(doc, "svc")
+	SetScalarInt(svc, "port", 9090)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+
+	if bytes.Contains(out, []byte("\r")) {
+		t.Fatalf("unexpected CR in output")
+	}
+
+	beforeLines := strings.Split(string(orig), "\n")
+	afterLines := strings.Split(string(out), "\n")
+	if len(beforeLines) != len(afterLines) {
+		t.Fatalf("line count changed: before=%d after=%d", len(beforeLines), len(afterLines))
+	}
+	// header and name line should be identical
+	if beforeLines[0] != afterLines[0] {
+		t.Fatalf("header line churned:\nbefore: %q\nafter:  %q", beforeLines[0], afterLines[0])
+	}
+	if beforeLines[1] != afterLines[1] {
+		t.Fatalf("svc name line churned:\nbefore: %q\nafter:  %q", beforeLines[1], afterLines[1])
+	}
+	// notes block should remain unchanged
+	for i := range beforeLines {
+		if strings.Contains(beforeLines[i], "notes: |") {
+			for j := 0; j <= 2; j++ { // notes line plus two content lines
+				if beforeLines[i+j] != afterLines[i+j] {
+					t.Fatalf("notes block changed at line %d:\nbefore: %q\nafter:  %q", i+j, beforeLines[i+j], afterLines[i+j])
+				}
+			}
+			break
+		}
+	}
+	// port line should reflect change and preserve inline comment spacing
+	portLine := getLineContaining(string(out), "port:")
+	if portLine != "  port: 9090  # inline" {
+		t.Fatalf("port line incorrect:\n%s", portLine)
 	}
 }
 

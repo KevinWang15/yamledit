@@ -1,0 +1,7 @@
+# header
+svc:
+  name: api
+  port: 8080  # inline
+  notes: |
+    multi
+    line
