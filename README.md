@@ -176,6 +176,10 @@ out, _ := yamledit.Marshal(doc)
   marshal (YAML semantics: last wins). This changes bytes but not meaning.
 * **Booleans normalize on edit.** A key you edit with `SetScalarBool` (or via JSON Patch) will render as bare `true`/
   `false` even if previously quoted. Unrelated booleans remain untouched.
+* **No global re‑encode.** If surgery and scoped rewrites are not possible, `Marshal` returns an error instead of
+  reformatting the whole document. All rewrites are per‑key/sequence, using recorded bounds.
+* **Sequence append/delete supported.** Scalar arrays can be appended to or truncated surgically; complex reorders may
+  still be unsupported and will error rather than churn bytes.
 
 ---
 
