@@ -3758,3 +3758,71 @@ func TestNestedListsConvertedToStringsWhenAddingField(t *testing.T) {
 		assert.Equal(t, "/v1", pathsList2[1], "second path should be '/v1'")
 	}
 }
+
+func TestStructuralRewriteSequenceAppendHandled(t *testing.T) {
+	orig := []byte(`arr:
+  - a
+`)
+	doc, err := Parse(orig)
+	require.NoError(t, err)
+
+	patch := []byte(`[{"op":"add","path":"/-","value":"b"}]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"arr"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "- b")
+}
+
+func TestStructuralRewriteSequenceDeleteHandled(t *testing.T) {
+	orig := []byte(`arr:
+  - a
+  - b
+`)
+	doc, err := Parse(orig)
+	require.NoError(t, err)
+
+	patch := []byte(`[{"op":"remove","path":"/1"}]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"arr"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "- a")
+	require.NotContains(t, string(out), "- b")
+}
+
+func TestStructuralRewriteSequenceAppendSupported(t *testing.T) {
+	orig := []byte(`arr:
+  - a
+`)
+	doc, err := Parse(orig)
+	require.NoError(t, err)
+
+	patch := []byte(`[{"op":"add","path":"/-","value":"b"}]`)
+	require.NoError(t, ApplyJSONPatchAtPathBytes(doc, patch, []string{"arr"}))
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "- b")
+}
+
+func TestStructuralRewriteSequenceDeleteSupported(t *testing.T) {
+	orig := []byte(`arr:
+  - a
+  - b
+`)
+	doc, err := Parse(orig)
+	require.NoError(t, err)
+
+	root := doc.Content[0]
+	arr := EnsurePath(root, "arr")
+	arr.Kind = yaml.SequenceNode
+	arr.Tag = "!!seq"
+	if len(arr.Content) > 1 {
+		arr.Content = arr.Content[:1]
+	}
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "b")
+}

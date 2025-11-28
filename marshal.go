@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	gyaml "github.com/goccy/go-yaml"
@@ -90,6 +91,18 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			continue
 		}
 		b := bounds[len(bounds)-1]
+		if isSequence(val) {
+			seqText, okSeq := renderSequenceValue(original, key, val, b, baseIndent)
+			if !okSeq {
+				return nil, false
+			}
+			if bytes.Equal(original[b.start:b.end], []byte(seqText)) {
+				continue
+			}
+			patches = append(patches, patch{start: b.start, end: b.end, data: []byte(seqText)})
+			continue
+		}
+
 		txt, ok := renderKeyValue(original, key, val, b, baseIndent)
 		if !ok {
 			continue
@@ -270,4 +283,72 @@ func findLast(ms gyaml.MapSlice, key string) (interface{}, bool) {
 		}
 	}
 	return nil, false
+}
+
+func isSequence(v interface{}) bool {
+	switch v.(type) {
+	case []interface{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func renderSequenceValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int) (string, bool) {
+	arr, ok := val.([]interface{})
+	if !ok {
+		return "", false
+	}
+	indentSpaces := currentIndent(original, b.start)
+
+	var sb strings.Builder
+	sb.WriteString(strings.Repeat(" ", indentSpaces))
+	sb.WriteString(key)
+	if len(arr) == 0 {
+		sb.WriteString(": []")
+		if b.end > b.start && b.end <= len(original) && original[b.end-1] == '\n' {
+			sb.WriteString("\n")
+		}
+		return sb.String(), true
+	}
+	sb.WriteString(":\n")
+	for _, el := range arr {
+		line := renderScalarLine(el)
+		sb.WriteString(strings.Repeat(" ", indentSpaces+baseIndent))
+		sb.WriteString("- ")
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	// Trim trailing newline if original region had none.
+	if b.end <= len(original) && b.end > b.start && original[b.end-1] != '\n' {
+		out := sb.String()
+		out = strings.TrimSuffix(out, "\n")
+		return out, true
+	}
+	return sb.String(), true
+}
+
+func renderScalarLine(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		if isSafeBareString(t) {
+			return t
+		}
+		return quoteNewStringToken(t)
+	case int:
+		return fmt.Sprintf("%d", t)
+	case float64:
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		b, err := yaml.Marshal(v)
+		if err != nil {
+			return fmt.Sprint(v)
+		}
+		return strings.TrimSpace(string(b))
+	}
 }
